@@ -2,9 +2,4 @@
 
 from gdpsolve.schemas import ExtractionRequest, ExtractionResult
 
-
-def main() -> None:
-    print("gdpsolve: not implemented yet; see docs/TRD.md")
-
-
-__all__ = ["ExtractionRequest", "ExtractionResult", "main"]
+__all__ = ["ExtractionRequest", "ExtractionResult"]

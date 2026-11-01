@@ -13,7 +13,7 @@ GDPSolve is a document-extraction system that runs locally. A **router** plans t
 
 ## 2. Benchmark: GDP.pdf
 
-Source harness: <https://github.com/surge-ai/gdp-pdf> (Inspect AI). Local copy: `data/gdp_pdf/`, fetched with `scripts/download_gdp_pdf.py`.
+Source harness: <https://github.com/surge-ai/gdp-pdf> (Inspect AI). Local copy: `data/gdp_pdf/`, fetched with `gdpsolve eval download`.
 
 **Profile** (measured on the downloaded data):
 
@@ -47,7 +47,7 @@ Source harness: <https://github.com/surge-ai/gdp-pdf> (Inspect AI). Local copy: 
 | FR-2 | Returns the extraction payload | `ExtractionResult` (`src/gdpsolve/schemas.py`) containing `answer` and `fields` |
 | FR-3 | Runs in batch | A batch is a set of queue jobs sharing a `batch_id`. Results are streamed back as they finish, with `wait()` / `as_completed()`. |
 | FR-4 | Reports confidence per extraction | `ExtractedField.confidence` plus a document-level `confidence` (§6.4) |
-| FR-5 | Handles password-protected documents | pikepdf decrypts with the passwords the caller supplies. Without them the status is `password_required`. Passwords are `SecretStr`, never logged or persisted. |
+| FR-5 | Handles password-protected documents | Ingest decrypts with the passwords the caller supplies. Without them the status is `password_required`. Passwords are `SecretStr`, never logged or persisted. |
 | FR-6 | Returns source grounding | `SourceSpan`: page, bounding box, verbatim text, and method (`text_layer` / `ocr` / `vlm`) for each field |
 | FR-7 | Returns document metadata | `DocumentMetadata`: sha256, page count, encryption, text-layer presence, and PDF info dictionary fields |
 
@@ -68,7 +68,7 @@ Source harness: <https://github.com/surge-ai/gdp-pdf> (Inspect AI). Local copy: 
  client ───▶│  SDK (local) │──────────────────────────────┐
             └──────────────┘                              ▼
                                                ┌─────────────────────┐
-                                               │ Ingest              │ open/decrypt (pikepdf),
+                                               │ Ingest              │ open/decrypt,          
                                                │                     │ metadata, sha256, page triage
                                                └─────────┬───────────┘
                                                          ▼
@@ -110,7 +110,7 @@ Defined in `src/gdpsolve/schemas.py`:
 ## 6. Components
 
 ### 6.1 Persistent queue (`gdpsolve.jobqueue`)
-- SQLite in WAL mode. Tables: `batches`, `jobs` (`id`, `batch_id`, `doc_sha256`, `plan_json`, `state`, `lease_until`, `attempts`, `deadline_at`), `results`, `traces` (tool calls and token logprobs for RL), `runs`.
+- SQLite in WAL mode. Tables: `batches`, `jobs` (`id`, `batch_id`, `doc_sha256`, `plan_json`, `state`, `lease_until`, `attempts`, `deadline_at`), `results`, `traces` (tool calls, token logprobs, and the `policy_version` that produced them, for async RL staleness control), `runs`.
 - Claim a job with `UPDATE … SET state='leased', lease_until=now+lease_s WHERE id=(SELECT … LIMIT 1) RETURNING *` inside `BEGIN IMMEDIATE`.
 - At-least-once delivery. Job id = hash(doc_sha256, instructions, plan_version), so retries are idempotent. Failures back off; jobs that fail too often move to a dead-letter state.
 - Traces live in the same DB, so every production or eval run can become training data. That is only allowed for synthetic documents; GDP.pdf traces are tagged `eval_only` and excluded.
@@ -130,7 +130,7 @@ The worker runs an agent loop on Inkling and stops when it emits `final_answer` 
 
 | Tool | Purpose |
 |---|---|
-| `pdf.text(page)` | Text layer with word-level bounding boxes (PyMuPDF) |
+| `pdf.text(page)` | Text layer with word-level bounding boxes |
 | `pdf.render(page, dpi, crop?)` | Page or crop image for VLM inspection |
 | `pdf.search(query)` | Lexical search across pages, returning hits with page and bounding box |
 | `ocr.layout(page)` | PaddleOCR-VL-1.6: blocks, reading order, tables (HTML), formulas, charts |
@@ -149,8 +149,8 @@ Calibration uses isotonic regression on synthetic held-out data, judged by ECE. 
 
 ### 6.5 Models (`gdpsolve.models`)
 - **Worker LLM:** `thinkingmachines/Inkling-Small` (276B total, 12B active, multimodal MoE) through the Tinker sampling client. `Inkling` (975B total, 41B active) is the upper-tier option the router can escalate to. Fine-tuning uses Tinker LoRA.
-- **OCR / layout:** `PaddlePaddle/PaddleOCR-VL-1.6`, run locally through `paddleocr` (CPU or MPS on a Mac is slow; see §7). The GGUF variant is an alternative for faster local inference.
-- **Router policy:** a small open model, trained with prime-rl on a GPU host or as a LoRA on Tinker. The choice is open (§10, Q3).
+- **OCR / layout:** `PaddlePaddle/PaddleOCR-VL-1.6`, run locally (CPU or MPS on a Mac is slow; see §7). The serving path (transformers, vLLM, or the GGUF variant) is decided at M2.
+- **Router policy:** a small open model trained as a LoRA on Tinker. The base model is open (§10, Q3).
 
 ## 7. Latency budget (p95, 46-page document)
 
@@ -185,15 +185,69 @@ Key levers:
 - **Schedule:** alternating updates (freeze one, update the other) to start, moving to joint updates once both are stable.
 
 ### 8.3 Algorithm: SDPO++ (async)
-*Working assumption, to be confirmed (§10, Q2).* SDPO is self-distillation policy optimization: the policy, conditioned on rich feedback (the judge's per-criterion rationales and failed criteria), acts as its own teacher. Its feedback-conditioned token distribution supplies dense per-token credit beyond the scalar reward. The "++" extensions we plan:
-- **Asynchronous off-policy rollouts**, with bounded staleness and importance correction. This is the prime-rl style.
-- **Multi-turn, tool-using trajectories**, with the loss masked so only model-generated tokens are trained.
-- **Joint policies**: separate LoRA adapters for π_R and π_W.
+Reference: [Scaling SDPO](https://www.trajectory.ai/field-notes/scaling-sdpo) (Trajectory AI field notes).
+
+**SDPO (Self-Distillation Policy Optimization).**
+- The **student** is the policy π_θ(·|s).
+- The **teacher** is *the same weights* conditioned on a hint *c* that was not available at rollout time: π_θ(·|s, c).
+- No separate teacher, reward model, or labels are needed.
+
+The loss is a per-token reverse (mode-seeking) KL from student to stop-gradient teacher:
+
+```
+L_SDPO(θ) = E_{τ∼π_θ} [ Σ_t KL( π_θ(·|s_t) ‖ stopgrad(π_θ(·|s_t, c)) ) ]
+```
+
+In practice it is estimated on sampled tokens using the teacher's log-probability. This gives dense credit at every token, so it is well-defined with **group size 1**. GRPO is not: with one rollout per task, its within-group ranking is undefined. That matters here because GDPSolve rollouts are long (≤ 40 tool calls) and expensive.
+
+**Off-policy problem.** Asynchronous rollouts are stale by *K* trainer steps. The naive importance ratio r_t = π_θ(a_t|s_t) / π_{θ−K}(a_t|s_t) is heavy-tailed. Because SDPO weights each token separately, one rare token can dominate an update, and the reference post saw training collapse within 50 steps at K = 3.
+
+**SDPO++ = SDPO + stabilizers.** These are the reference configuration and our starting hyperparameters:
+
+| Setting | Value |
+|---|---|
+| PPO ratio clipping | ε = 0.2 |
+| Per-token advantage clipping | 3× running mean. Preferred over a KL-to-reference penalty, which would cost a second forward pass and anchor the policy. |
+| Max staleness | K = 3. Accuracy held through K = 3 and degraded beyond it; about 2× wall-clock speedup. |
+| Group size | G = 1, keeping groups where every rollout failed |
+
+**Hints for GDPSolve (*c*).** These are ordered by expected strength. Each needs an ablation.
+1. The judge's per-criterion verdicts and rationales for the rollout's own answer: which criteria failed and why.
+2. The reference answer for the synthetic task.
+3. A successful sibling rollout, when one exists.
+
+Hints must not let the teacher simply copy the answer. The post flags hint-copying as the hardest open issue. Mitigation: give criteria-level feedback rather than verbatim answers, and enforce grounding rules in the reward.
+
+**Known limit.** SDPO sharpens behaviors the model already samples. It does not reliably teach behaviors the model never samples. Tasks where the base pass rate is near zero (likely for floor-plan symbols) may need a behavior-cloning or DAgger warm start first (§12, M3/M4).
+
+**Pipeline mapping:**
+- Workers stream trajectories into the SQLite `traces` table, tagged with `policy_version` (§6.1).
+- The trainer pulls batches that satisfy staleness ≤ K.
+- For each sampled token, it computes teacher log-probabilities under the hint, the clipped importance ratio, and the clipped advantage, then updates the LoRA.
+- Router and worker keep separate LoRA adapters (π_R, π_W) trained with the same loss. The router's trajectory is the plan, and its hint is the per-stage latency and outcome of the episode.
 
 ### 8.4 Infrastructure
-- **Tinker:** LoRA training and sampling for Inkling (the worker). `tinker-cookbook` supplies RL loop primitives.
-- **prime-rl:** async RL orchestrator, run from its own checkout on a Linux GPU host. It is not a project dependency because it pins `transformers` and needs CUDA. `verifiers` and `prime` are in the `train` extra so environments and rubrics can be shared.
-- **OpenEnv:** environment server, installed in the separate `env` extra because `openenv` needs `mcp<2`, which conflicts with `verifiers`.
+**Tinker is the single training and sampling backend.**
+- **Tinker:** LoRA training and sampling for both policies: Inkling for the worker and a small open model for the router.
+- **tinker-cookbook:** its `rl` module supplies the environment interface, rollout and training loop primitives, and renderers. SDPO++ (§8.3) is built on these.
+- **verifiers (Prime Intellect), used as needed:** for rubric and reward definitions and text-only environments.
+  - tinker-cookbook's `recipes/verifiers_rl` runs verifiers environments on Tinker, but only text-based ones.
+  - The worker sees page images, so its main environment is implemented directly against `tinker_cookbook.rl`, reusing verifiers rubrics where they fit.
+  - The `prime` CLI is only for installing Environments Hub packages (`uv tool install prime`). It is not a project dependency.
+- **prime-rl:** not used.
+- **OpenEnv:** optional sandbox server. verifiers v1 already ships an `openenv` taskset (`verifiers[openenv]`), so OpenEnv can sit behind the verifiers interface rather than being integrated separately.
+
+**Multimodal environment options**, surveyed 2026-11-01 against installed tinker-cookbook 0.5.9 and verifiers 0.4.0:
+
+| Option | Images in observations? | Fit for GDPSolve |
+|---|---|---|
+| `tinker_cookbook.rl.Env` (custom) | Yes. Observations are `tinker.ModelInput`, and the Inkling renderer (`tml_v0`) handles image parts. Model info marks both Inkling models `is_vl=True`. | **Primary.** Full control over multi-turn tools, page images, and the SDPO teacher pass. |
+| verifiers v1 environment | Yes, at the message level. v1 types include `image_url` content parts, and its training client checks the renderer before passing images through. | **Secondary.** Use it for rubrics, reward functions, and taskset packaging, so environments could later be published to Prime's Environments Hub. |
+| `recipes/verifiers_rl` (verifiers on Tinker) | No. The recipe states it supports text-based environments only. | Not usable for the worker until it supports images. |
+| Harbor (`verifiers[harbor]`, `recipes/harbor_rl`) | Not natively. Harbor tasks are containers with tests: the agent gets a bash tool, and the reward comes from test results. | Possible as a sandbox format, where the PDF lives in the container and the agent renders pages through tools. Overkill until we need containerized tools. |
+| `recipes/rubric` | Text only, as written. | Reference for the LLM-judge rubric reward (sum of per-criterion grades), which matches GDP.pdf grading. |
+| `recipes/sdft` | Text only, as written. | Reference for the Tinker self-distillation mechanics: teacher logprobs under context, per-token KL. SDPO++ extends it with feedback hints and the off-policy stabilizers. |
+| `recipes/vlm_classifier` | Yes, but supervised and Qwen-only. | Reference for passing images through Tinker renderers. |
 
 ### 8.5 Contamination guard
 - The canary GUID from the GDP.pdf card is checked against all training corpora.
@@ -219,18 +273,30 @@ Key levers:
 | # | Item | Notes / proposed resolution |
 |---|---|---|
 | R1 | "Runs locally" vs. model size | Inkling-Small (276B) cannot run on a laptop. Proposal: everything except LLM sampling runs locally, and the worker calls Tinker. A fully offline path would need a smaller local VLM, at an accuracy cost. |
-| R2 | SDPO++ is not a standard published algorithm | §8.3 states our assumption. It needs a written spec before training code is written. |
+| R2 | SDPO++ hint design | Algorithm and hyperparameters come from the Scaling SDPO post (§8.3). The open risk is hint design: copying, and behaviors the model never samples. |
 | R3 | Benchmark is QA, not pure extraction | The system must produce graded free-text answers (§2). Structured `fields` support grounding and confidence. |
 | R4 | No encrypted PDFs in GDP.pdf | FR-5 is validated on synthetic encrypted variants only. |
 | R5 | Official dataset unavailable | We use a pinned mirror. Re-verify file hashes against the official source before reporting results. |
 | R6 | Local OCR throughput | PaddleOCR-VL on CPU/MPS may exceed the OCR budget on large scans. Mitigations: router page selection, caching, GGUF/llama.cpp, or a remote GPU OCR server. |
-| R7 | Dependency friction | uv overrides `click>=8.4.2` (deepeval 4.x caps `click<8.4`). OpenEnv is isolated in its own extra. |
-| Q1 | Prime-RL vs. Tinker | Are both needed? Proposal: Tinker for the worker (Inkling LoRA), prime-rl for the router (small open model on our GPUs). |
-| Q2 | SDPO++ definition | Paper or internal spec? Which feedback signal conditions the teacher? |
-| Q3 | Router model | Size and base model, and whether it trains on Tinker or locally. |
+| R7 | Dependency friction | Known conflicts to handle when these are added back: deepeval 4.x caps `click<8.4` while huggingface-hub needs ≥8.4.2 (fix with a uv override); openenv needs `mcp<2`, which conflicts with verifiers. |
+| Q1 | Training backend | Resolved: Tinker for both policies, verifiers as needed. prime-rl is dropped. |
+| Q2 | SDPO++ hint source | Resolved: algorithm per §8.3. Still open: which hint (judge rationales, reference answer, or sibling rollout) works best. Needs an ablation on synthetic data. |
+| Q3 | Router model | Size and base model, chosen from the models Tinker supports. |
 | Q4 | Judge for training rewards | Using the leaderboard judge (Gemini 3.5 Flash) for training rewards risks overfitting to the judge. Proposal: train against an open judge and evaluate with the official one. |
 
-## 11. Milestones
+## 11. CLI
+
+All scripts, runs, and pipelines are subcommands of `gdpsolve` (`src/gdpsolve/cli.py`), grouped by stage. A group is added when its first command is implemented. Today only `eval download` exists; the table is the planned layout.
+
+| Group | Stage | Commands |
+|---|---|---|
+| `data` | Training data | `synth`, `check-contamination` |
+| `env` | RL environment | `serve` |
+| `train` | SDPO++ RL | `worker`, `router` |
+| `eval` | GDP.pdf | `download`, `run` |
+| `serve` | Inference | `extract`, `worker` |
+
+## 12. Milestones
 
 | Milestone | Scope | Exit criterion |
 |---|---|---|
