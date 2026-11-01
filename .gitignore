@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Benchmark data: eval-only, never commit (see docs/TRD.md section 2)
+/data/
+/pdf_cache/
+
+# Runtime state
+/var/
+*.db
+*.db-wal
+*.db-shm
+logs/
+checkpoints/
+wandb/
+
+# Secrets
+.env
+.env.*
+
+.DS_Store
+
+# Tool caches
+.deepeval/

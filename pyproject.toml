@@ -1,0 +1,57 @@
+[project]
+name = "gdpsolve"
+version = "0.1.0"
+description = "Router + persistent queue + tool-using worker system for complex document extraction, co-trained with RL against GDP.pdf"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "datasets>=4.0",
+    "httpx>=0.28.1",
+    "huggingface-hub>=1.31",
+    "pikepdf>=10.17.0",
+    "pydantic>=2.14.2",
+    "pymupdf>=2.0",
+    "pyyaml>=6.0",
+    "tinker>=0.36.0",
+    "typer>=0.15",
+]
+
+[project.scripts]
+gdpsolve = "gdpsolve:main"
+
+[project.optional-dependencies]
+ocr = [
+    "paddleocr[doc-parser]>=3.7",
+    "paddlepaddle>=3.3.1",
+]
+train = [
+    "prime>=0.19",
+    "tinker-cookbook>=0.5.9",
+    "torch>=2.15.0",
+    "transformers>=5.22.1",
+    "verifiers>=0.4.0",
+]
+# OpenEnv servers run as a separate process (mcp<2 clashes with verifiers).
+env = [
+    "openenv>=0.11",
+]
+eval = [
+    "deepeval>=4.3",
+    "inspect-ai>=0.3.287",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.15,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.3",
+]
+
+[tool.uv]
+# deepeval 4.x caps click<8.4 but huggingface-hub>=1.31 requires click>=8.4.2.
+override-dependencies = ["click>=8.4.2"]
+conflicts = [[{ extra = "env" }, { extra = "train" }]]
+environments = ["sys_platform == 'darwin'", "sys_platform == 'linux'"]
