@@ -336,12 +336,14 @@ CHECKERS: dict[str, CheckerConfig] = {
 
 
 class Criterion(BaseModel):
-    """One rubric criterion. The verifier model sees only `text`."""
+    """One rubric criterion: the yes/no question verify() asks about a response.
 
-    id: str
+    Only what the official judge uses: GDP.pdf's other criterion columns (type, severity, ...)
+    do not affect scoring and stay in the dataset.
+    """
+
+    id: str  # e.g. "{task_id}:{N}"; matches CriterionScore.criterion_id
     text: str
-    type: Literal["Primary Intent", "Dodged Bullet"]
-    severity: Literal["Certain dealbreaker", "Possible dealbreaker", "Unlikely dealbreaker"] | None = None
 
 
 class VerifyRequest(BaseModel):

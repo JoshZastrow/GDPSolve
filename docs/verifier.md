@@ -201,8 +201,7 @@ Rubric input (`VerifyRequest`):
 
 ```json
 {"response": "YTD revenue was $7.4M.",
- "criteria": [{"id": "c1", "text": "The response should state YTD revenue: $7.4M.",
-               "type": "Primary Intent", "severity": "Certain dealbreaker"}]}
+ "criteria": [{"id": "c1", "text": "The response should state YTD revenue: $7.4M."}]}
 ```
 
 Rubric output (`VerifyResult`; `mean_criteria` and `all_pass` are computed and included in the JSON):
@@ -233,7 +232,7 @@ Region images are read from the object store by `image.sha256`.
 | Schema | Fields |
 |---|---|
 | `CheckerConfig` | `base_model`, `renderer`, `checkpoint`; derived `model_ref` |
-| `Criterion` | `id`, `text` (the only field the model sees), `type` (Primary Intent / Dodged Bullet), `severity` |
+| `Criterion` | `id` (matches the score back), `text` (what the model is asked). GDP.pdf's other criterion columns don't affect official scoring, so they stay in the dataset. |
 | `VerifyRequest` | `response` (= `ExtractionResult.answer`), `criteria` |
 | `VerifyResult` | `scores: list[CriterionScore]` (`criterion_id`, `p_pass` or None), `checkpoint`; derived `mean_criteria`, `all_pass` |
 | `Claim` | `id`, `text`, `source_ids` |
@@ -307,5 +306,4 @@ Commands are `gdpsolve <action> <resource>`.
 - **Labeling judge quality:** measure Inkling-judge vs. Gemini agreement on GDP.pdf baseline responses
   before training. The verifier can't be better than its labels.
 - **Token cost:** measure Nemotron vs. Inkling-Small prompt tokens on full-page crops at 150 DPI, and check per-model Tinker pricing.
-- **Criterion weights:** GDP.pdf severity may deserve reward weights. Decide once baseline labels exist.
 - **Long responses:** truncation policy, or mark them unscored, when response + criterion exceed the context budget.

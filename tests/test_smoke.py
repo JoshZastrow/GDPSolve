@@ -92,8 +92,7 @@ def test_verifier_contracts_roundtrip():
         VerifyRequest,
     )
 
-    crit = Criterion(id="c1", text="The response should state YTD revenue: $7.4M.", type="Primary Intent",
-                     severity="Certain dealbreaker")
+    crit = Criterion(id="c1", text="The response should state YTD revenue: $7.4M.")
     months = [SourceSpan(id=f"s{i}", page=3, text=f"{v:,}", method="text_layer") for i, v in enumerate(
         [1200, 1250, 1180, 1240, 1260, 1270], start=1)]
     ytd = ExtractedField(name="ytd_revenue", value=7400, confidence=0.9, sources=months, kind="computed",
