@@ -2,7 +2,7 @@
 
 A local document-extraction system (router → persistent SQLite queue → parallel tool-using workers) whose router and extraction model are co-trained with async RL to improve accuracy on the [GDP.pdf](https://github.com/surge-ai/gdp-pdf) benchmark.
 
-Design: [`docs/TRD.md`](docs/TRD.md).
+Design: [`docs/TRD.md`](docs/TRD.md) · [`docs/architecture.md`](docs/architecture.md).
 
 ## Setup
 
@@ -35,6 +35,7 @@ src/gdpsolve/
   schemas.py      request/result contract
   eval/gdp_pdf.py GDP.pdf download
 docs/TRD.md       technical requirements
+docs/architecture.md  pipeline interfaces (+ diagrams/architecture.html)
 ```
 
 > GDP.pdf is an evaluation-only benchmark. Do not train on it or on anything derived from it.

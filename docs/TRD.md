@@ -63,47 +63,16 @@ Source harness: <https://github.com/surge-ai/gdp-pdf> (Inspect AI). Local copy: 
 
 ## 4. Architecture
 
-```
-            ┌──────────────┐  extract(path, instructions)
- client ───▶│  SDK (local) │──────────────────────────────┐
-            └──────────────┘                              ▼
-                                               ┌─────────────────────┐
-                                               │ Ingest              │ open/decrypt,          
-                                               │                     │ metadata, sha256, page triage
-                                               └─────────┬───────────┘
-                                                         ▼
-                                               ┌─────────────────────┐
-                                               │ Router (policy π_R) │ plan: pages of interest,
-                                               │                     │ tool budget, fan-out, model tier
-                                               └─────────┬───────────┘
-                                                         ▼ enqueue
-                                ┌───────────────────────────────────────────┐
-                                │ SQLite job queue (WAL): jobs, leases,     │
-                                │ attempts, results, traces, run manifests  │
-                                └───────┬─────────────┬─────────────┬───────┘
-                                        ▼             ▼             ▼
-                                   ┌─────────┐   ┌─────────┐   ┌─────────┐
-                                   │ Worker  │   │ Worker  │   │ Worker  │  agent loop (π_W)
-                                   └────┬────┘   └────┬────┘   └────┬────┘
-                     tools (local) ─────┼─────────────┼─────────────┤
-                     text layer · render page · PaddleOCR-VL-1.6 · table · symbol · search
-                                        ▼
-                               Inkling via Tinker (remote sampling)
-                                        ▼
-                               Aggregator: merge sub-jobs → answer, fields,
-                               grounding, confidence → ExtractionResult
-```
-
-**Process model.** A single host runs one SDK/router process, *N* worker processes, and one OCR server. They share one SQLite file. Workers are processes, not threads, so PaddleOCR and PDF rendering avoid GIL contention.
+See [architecture.md](architecture.md) and its [diagram](diagrams/architecture.html). In short:
+- Every caller (eval, CLI, SDK) calls one function, `process(ExtractionRequest) -> ExtractionResult`.
+- `process()` ingests the PDF, asks the router for jobs, puts them on a SQLite queue, waits for reports, and merges them.
+- Worker processes claim jobs and run the Inkling agent loop on Tinker. Their tools store page images and OCR in a content-addressed object store, and they publish results through `Report`s.
 
 ## 5. Data contract
 
-Defined in `src/gdpsolve/schemas.py`:
-
-- `ExtractionRequest {path, instructions, output_schema?, passwords[], deadline_s=300}`
-- `ExtractionResult {job_id, document: DocumentMetadata, status, answer, fields[], confidence, latency_s, error}`
-- `ExtractedField {name, value, confidence, sources: SourceSpan[]}`
-- `SourceSpan {page, bbox?, text, method}`
+`src/gdpsolve/schemas.py` is the source of truth:
+- **Public:** `ExtractionRequest` → `ExtractionResult`, with `ExtractedField`, `SourceSpan` and `DocumentMetadata`.
+- **Internal:** `Document`, `Job`, `Report` and `ObjectRef`.
 
 `status` ∈ `ok | partial | failed | password_required`. A `partial` status means the deadline was hit and the best answer so far was returned.
 
