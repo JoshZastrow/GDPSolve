@@ -27,8 +27,5 @@ wandb/
 
 .DS_Store
 
-# Tool caches
-.deepeval/
-
 # Reference code (separate repo, not ours)
 /dsh-superagent-prototype/

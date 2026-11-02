@@ -8,24 +8,24 @@ Design: [`docs/TRD.md`](docs/TRD.md) · [`docs/architecture.md`](docs/architectu
 
 ```bash
 uv sync --extra train            # core + Tinker training stack
-uv run gdpsolve eval download    # GDP.pdf -> data/gdp_pdf (eval only, gitignored)
+uv run gdpsolve download gdp-pdf # GDP.pdf -> data/gdp_pdf (eval only, gitignored)
 uv run pytest
 ```
 
 | extra   | contents                                  |
 |---------|-------------------------------------------|
 | (core)  | pydantic, typer, huggingface-hub          |
-| `train` | tinker, tinker-cookbook, verifiers        |
+| `train` | tinker, tinker-cookbook                   |
 
-Dependencies are added when the code that needs them lands (TRD §8.4 and R7 note known conflicts).
+Dependencies are added when the code that needs them lands (TRD §8.4).
 
 ## CLI
 
-Every script, run, and pipeline is a `gdpsolve` subcommand, grouped by system stage (TRD §11).
+Every script, run, and pipeline is a `gdpsolve <action> <resource>` subcommand (TRD §11).
 
 | command                  | what it does                              |
 |--------------------------|-------------------------------------------|
-| `gdpsolve eval download` | fetch the pinned GDP.pdf benchmark        |
+| `gdpsolve download gdp-pdf` | fetch the pinned GDP.pdf benchmark     |
 
 ## Layout
 
