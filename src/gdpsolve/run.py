@@ -7,6 +7,9 @@ Each task changes only its sections. tinker and tinker_cookbook are imported ins
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import os
 import queue
 import threading
@@ -16,7 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
+from gdpsolve.eval import pdf_input
 from gdpsolve.schemas import (
+    BoundingBox,
     Crop,
     Document,
     ExtractionRequest,
@@ -24,11 +29,13 @@ from gdpsolve.schemas import (
     InspectPdf,
     Job,
     Message,
+    Post,
     ReadNativeText,
     Recognize,
     Region,
     Render,
     Report,
+    Split,
 )
 
 if TYPE_CHECKING:
@@ -147,42 +154,216 @@ def ingest(req: ExtractionRequest) -> Document | ExtractionResult:
 # --- tools ---
 
 
+# pdfium is not thread-safe; workers share this lock for every pdfium call.
+_PDFIUM_LOCK = threading.Lock()
+
+
+def _memo(run: Run, tool: str, args, compute: Callable[[], str]) -> str:
+    """`compute()` once for each (doc, tool, canonical args); later calls read `run.memo`."""
+    key = hashlib.sha256(json.dumps([run.doc.metadata.sha256, tool, args.model_dump(mode="json")],
+                                    sort_keys=True).encode()).hexdigest()
+    if key not in run.memo:
+        result = compute()
+        with run.lock:
+            run.memo[key] = result
+    return run.memo[key]
+
+
 def inspect_pdf(run: Run, args: InspectPdf) -> str:
     """Page size, rotation, text layer, and image cover of one page, as text."""
-    raise NotImplementedError
+    def compute() -> str:
+        import pypdfium2.raw as pdfium_c
+
+        with _PDFIUM_LOCK:
+            page = _open(run)[args.page - 1]
+            w, h = page.get_size()
+            has_text = bool(pdf_input.page_text(page))
+            area = 0.0
+            for obj in page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE]):
+                x0, y0, x1, y1 = obj.get_bounds()
+                area += max(0.0, min(x1, w) - max(x0, 0)) * max(0.0, min(y1, h) - max(y0, 0))
+            rotation = page.get_rotation()
+        return (f"page {args.page}: {w:g} x {h:g} pt, rotation {rotation}, has_text_layer={has_text}, "
+                f"image_cover={min(1.0, area / (w * h)):.2f}")
+    return _memo(run, "inspect_pdf", args, compute)
 
 
 def read_native_text(run: Run, args: ReadNativeText) -> str:
-    """Text layer of one page, or of one box."""
-    raise NotImplementedError
+    """Text layer of one page, or of one box (points from the top left of the page)."""
+    def compute() -> str:
+        with _PDFIUM_LOCK:
+            page = _open(run)[args.page - 1]
+            if args.bbox is None:
+                return pdf_input.page_text(page)
+            h = page.get_height()
+            b = args.bbox
+            return page.get_textpage().get_text_bounded(left=b.x0, bottom=h - b.y1, right=b.x1, top=h - b.y0).strip()
+    return _memo(run, "read_native_text", args, compute)
 
 
 def render(run: Run, args: Render) -> Region:
     """PNG of one page at `dpi`, in the store and in `run.regions`."""
-    raise NotImplementedError
+    return _region(run, "render", args, args.page, None, args.dpi)
 
 
 def crop(run: Run, args: Crop) -> Region:
-    """PNG of one box at `dpi`, in the store and in `run.regions`."""
-    raise NotImplementedError
+    """PNG of one box at `dpi`, in the store and in `run.regions`. The box gets `padding` points on each side."""
+    return _region(run, "crop", args, args.page, args.bbox, args.dpi, args.padding)
+
+
+def _open(run: Run):
+    """The document as a pdfium PdfDocument; call while holding _PDFIUM_LOCK."""
+    import pypdfium2 as pdfium
+
+    from gdpsolve.verifier import store
+
+    return pdfium.PdfDocument(store.get(run.doc.pdf))
+
+
+def _region(run: Run, tool: str, args, page_no: int, bbox: BoundingBox | None, dpi: int, padding: float = 0.0) -> Region:
+    """Render a page, or a box of it (points from the top left), to a PNG Region; memoized."""
+    def compute() -> str:
+        from gdpsolve.verifier import store
+
+        with _PDFIUM_LOCK:
+            page = _open(run)[page_no - 1]
+            w, h = page.get_size()
+            box = None
+            cut = (0, 0, 0, 0)
+            if bbox is not None:
+                box = BoundingBox(page=page_no, x0=max(0.0, bbox.x0 - padding), y0=max(0.0, bbox.y0 - padding),
+                                  x1=min(w, bbox.x1 + padding), y1=min(h, bbox.y1 + padding))
+                cut = (box.x0, h - box.y1, w - box.x1, box.y0)  # left, bottom, right, top
+            image = page.render(scale=dpi / 72, crop=cut).to_pil()
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        ref = store.put(buf.getvalue(), "image/png")
+        sha = run.doc.metadata.sha256
+        rid = hashlib.sha256(json.dumps([sha, page_no, box and box.model_dump(), dpi, []]).encode()).hexdigest()
+        return Region(id=rid, doc_sha256=sha, page=page_no, bbox=box, dpi=dpi, image=ref).model_dump_json()
+    region = Region.model_validate_json(_memo(run, tool, args, compute))
+    with run.lock:
+        run.regions.setdefault(region.id, region)
+    return region
 
 
 def recognize(run: Run, args: Recognize) -> str:
-    """`run.recognizer` on one Region: text, HTML, or LaTeX."""
-    raise NotImplementedError
+    """`run.recognizer` on one Region: text, a Markdown table, or LaTeX."""
+    from PIL import Image
+
+    from gdpsolve.verifier import store
+
+    region = run.regions.get(args.region)
+    if region is None:
+        return f"unknown region: {args.region}; make one with render or crop"
+    return _memo(run, "recognize", args,
+                 lambda: run.recognizer(Image.open(io.BytesIO(store.get(region.image))), args.mode))
 
 
 def run_tool(run: Run, job: Job, tool: str, args: dict) -> list[dict]:
     """Run one of the 8 tools for `job`; the observation as content parts ({"type": "text"|"image", ...})."""
-    raise NotImplementedError
+    from PIL import Image
+
+    from gdpsolve.verifier import store
+
+    texts = {"inspect_pdf": (InspectPdf, inspect_pdf), "read_native_text": (ReadNativeText, read_native_text),
+             "recognize": (Recognize, recognize)}
+    images = {"render": (Render, render), "crop": (Crop, crop)}
+    if tool in texts:
+        model, fn = texts[tool]
+        return [{"type": "text", "text": fn(run, model.model_validate(args))}]
+    if tool in images:
+        model, fn = images[tool]
+        region = fn(run, model.model_validate(args))
+        image = Image.open(io.BytesIO(store.get(region.image)))
+        return [{"type": "text", "text": f"region {region.id}: page {region.page}, {region.dpi} dpi, "
+                                         f"{image.width}x{image.height} px"},
+                {"type": "image", "image": image}]
+    if tool == "split":
+        a = Split.model_validate(args)
+        run.post(Message(thread=run.req.id, job_id=job.id, kind="split", pages=a.pages or [],
+                         pages_per_job=a.pages_per_job))
+        return [{"type": "text", "text": "split requested"}]
+    if tool == "post":
+        a = Post.model_validate(args)
+        run.post(Message(thread=run.req.id, job_id=job.id, kind=a.kind, pages=a.pages, note=a.note))
+        return [{"type": "text", "text": "posted"}]
+    if tool == "report":
+        raise NotImplementedError("report: hook for the worker task (T4)")
+    raise ValueError(f"unknown tool: {tool}")
 
 
 # --- recognizer ---
 
 
+LLAMA_LOG = Path("var/log/llama-serve.log")
+_warmed: set[str] = set()  # server URLs that ensure_ocr_server has warmed up
+
+
+def _healthy(url: str) -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{url}/health", timeout=2) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
 def ensure_ocr_server(url: str = OCR_URL, timeout_s: int = 300) -> float:
-    """Start the PaddleOCR-VL server if it is not up, then warm it up; returns the warm-up seconds."""
-    raise NotImplementedError
+    """Start the PaddleOCR-VL server if it is not up, then warm it up; returns the warm-up seconds.
+
+    A second call for the same URL does nothing and returns 0.0. The server is never stopped.
+    """
+    import shutil
+    import subprocess
+    from urllib.parse import urlparse
+
+    from PIL import Image, ImageDraw
+
+    if url in _warmed:
+        return 0.0
+    if not _healthy(url):
+        llama = shutil.which("llama") or str(Path.home() / ".local/bin/llama")
+        cmd = [llama, "serve", "-hf", "PaddlePaddle/PaddleOCR-VL-1.6-GGUF", "--temp", "0",
+               "--port", str(urlparse(url).port), "-np", "4", "--alias", "paddleocr-vl"]
+        LLAMA_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LLAMA_LOG.open("ab") as log:
+            subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        end = time.time() + timeout_s
+        while not _healthy(url):
+            if time.time() >= end:
+                raise RuntimeError(f"OCR server at {url} not healthy after {timeout_s} s; see {LLAMA_LOG}")
+            time.sleep(2)
+    image = Image.new("RGB", (160, 64), "white")
+    ImageDraw.Draw(image).text((16, 12), "warm", fill="black", font_size=32)
+    start = time.time()
+    PaddleRecognizer(url)(image, "text")
+    _warmed.add(url)
+    return time.time() - start
+
+
+def otsl_to_markdown(otsl: str) -> str:
+    """PaddleOCR-VL table output (OTSL: <fcel> cell, <ecel> empty cell, <nl> end of row) as a Markdown table.
+
+    Merged cells (<lcel>, <ucel>, <xcel>) become empty cells. Text without OTSL tags is returned as it is.
+    """
+    import re
+
+    if not re.search(r"<(fcel|ecel)>", otsl):
+        return otsl
+    rows = []
+    for line in otsl.split("<nl>"):
+        parts = re.split(r"<(fcel|ecel|lcel|ucel|xcel)>", line)  # [before, tag, text, tag, text, ...]
+        cells = [text.strip().replace("|", "\\|") if tag == "fcel" else ""
+                 for tag, text in zip(parts[1::2], parts[2::2])]
+        if cells:
+            rows.append(cells)
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(r) + " |" for r in rows]
+    lines.insert(1, "| " + " | ".join(["---"] * width) + " |")
+    return "\n".join(lines)
 
 
 class PaddleRecognizer:
@@ -192,8 +373,27 @@ class PaddleRecognizer:
         self.url = url
 
     def __call__(self, image: Image.Image, mode: str) -> str:
-        """Text of the first choice for `image` with the prompt OCR_PROMPTS[mode]."""
-        raise NotImplementedError
+        """Text of the first choice for `image` with the prompt OCR_PROMPTS[mode]; tables as Markdown."""
+        import base64
+        import urllib.request
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        body = {
+            "model": "paddleocr-vl",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": OCR_PROMPTS[mode]},
+            ]}],
+            "temperature": 0,
+            "max_tokens": 2048,
+        }
+        req = urllib.request.Request(f"{self.url}/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            text = json.load(resp)["choices"][0]["message"]["content"]
+        return otsl_to_markdown(text) if mode == "table" else text
 
 
 # --- policy ---

@@ -5,6 +5,7 @@ Each task adds its tests only in its own `# --- T<n> ---` section.
 
 import hashlib
 import io
+import os
 import threading
 import time
 
@@ -156,14 +157,6 @@ def test_config():
 
 
 STUBS = [
-    ("inspect_pdf", lambda r: run.inspect_pdf(r, None)),
-    ("read_native_text", lambda r: run.read_native_text(r, None)),
-    ("render", lambda r: run.render(r, None)),
-    ("crop", lambda r: run.crop(r, None)),
-    ("recognize", lambda r: run.recognize(r, None)),
-    ("run_tool", lambda r: run.run_tool(r, None, "inspect_pdf", {"page": 1})),
-    ("ensure_ocr_server", lambda r: run.ensure_ocr_server()),
-    ("PaddleRecognizer", lambda r: run.PaddleRecognizer()(None, "text")),
     ("TinkerPolicy", lambda r: run.TinkerPolicy().step([])),
     ("run_job", lambda r: run.run_job(r, None)),
     ("worker", lambda r: run.worker(r)),
@@ -239,7 +232,274 @@ def test_ingest_missing_file_fails(tmp_path, monkeypatch):
 # --- T2 ---
 
 
+def doc_run(tmp_path, monkeypatch, pdf: bytes, recognizer=None) -> run.Run:
+    """A Run over `pdf`, with the store in tmp_path."""
+    from gdpsolve.schemas import Document, DocumentMetadata
+    from gdpsolve.verifier import store
+
+    monkeypatch.chdir(tmp_path)
+    ref = store.put(pdf, "application/pdf")
+    meta = DocumentMetadata(filename="a.pdf", sha256=ref.sha256, page_count=len(pdfium.PdfDocument(pdf)),
+                            encrypted=False, has_text_layer=True)
+    r = make_run(tmp_path, recognizer=recognizer)
+    r.doc = Document(metadata=meta, pdf=ref)
+    return r
+
+
+def test_read_native_text_is_the_page_text(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello", "Total due 42"]))
+    assert run.read_native_text(r, run.ReadNativeText(page=2)) == "Total due 42"
+
+
+def test_read_native_text_in_a_box(tmp_path, monkeypatch):
+    from gdpsolve.schemas import BoundingBox
+
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    # boxes are in points from the top left; the text baseline is at 792 - 700 = 92
+    inside = BoundingBox(page=1, x0=60, y0=60, x1=300, y1=110)
+    outside = BoundingBox(page=1, x0=60, y0=400, x1=300, y1=500)
+    assert run.read_native_text(r, run.ReadNativeText(page=1, bbox=inside)) == "Hello"
+    assert run.read_native_text(r, run.ReadNativeText(page=1, bbox=outside)) == ""
+
+
+def test_inspect_pdf_text_page(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    out = run.inspect_pdf(r, run.InspectPdf(page=1))
+    assert "612 x 792" in out and "rotation 0" in out
+    assert "has_text_layer=True" in out and "image_cover=0.00" in out
+
+
+def test_inspect_pdf_scan_has_no_text_layer(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_scan("Hello"))
+    out = run.inspect_pdf(r, run.InspectPdf(page=1))
+    assert "has_text_layer=False" in out and "image_cover=1.00" in out
+
+
+def test_render_gives_a_region_with_a_png_in_the_store(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from gdpsolve.verifier import store
+
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    region = run.render(r, run.Render(page=1, dpi=72))
+    assert region.page == 1 and region.dpi == 72 and region.bbox is None and region.ops == []
+    assert region.doc_sha256 == r.doc.metadata.sha256 and region.image.media_type == "image/png"
+    assert r.regions[region.id] == region
+    image = Image.open(io.BytesIO(store.get(region.image)))
+    assert image.format == "PNG" and image.size == (612, 792)
+    assert region.id != run.render(r, run.Render(page=1, dpi=100)).id
+
+
+def test_crop_gives_a_padded_region(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from gdpsolve.schemas import BoundingBox
+    from gdpsolve.verifier import store
+
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    box = BoundingBox(page=1, x0=100, y0=100, x1=200, y1=150)
+    region = run.crop(r, run.Crop(page=1, bbox=box, padding=10, dpi=144))
+    assert (region.bbox.x0, region.bbox.y0, region.bbox.x1, region.bbox.y1) == (90, 90, 210, 160)
+    assert Image.open(io.BytesIO(store.get(region.image))).size == (240, 140)
+    assert r.regions[region.id] == region
+
+
+def test_same_arguments_make_one_memo_entry(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    assert run.read_native_text(r, run.ReadNativeText(page=1)) == "Hello"
+    assert run.read_native_text(r, run.ReadNativeText(page=1)) == "Hello"
+    assert len(r.memo) == 1
+    a = run.render(r, run.Render(page=1, dpi=72))
+    b = run.render(r, run.Render(page=1, dpi=72))
+    assert a == b and len(r.memo) == 2 and len(r.regions) == 1
+
+
+def test_run_tool_gives_content_parts(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    assert run.run_tool(r, None, "read_native_text", {"page": 1}) == [{"type": "text", "text": "Hello"}]
+    parts = run.run_tool(r, None, "render", {"page": 1, "dpi": 72})
+    assert [p["type"] for p in parts] == ["text", "image"]
+    assert next(iter(r.regions)) in parts[0]["text"] and parts[1]["image"].size == (612, 792)
+    with pytest.raises(ValueError):
+        run.run_tool(r, None, "detect_layout", {"page": 1})
+
+
+def test_run_tool_split_and_post_go_to_the_thread(tmp_path, monkeypatch):
+    from gdpsolve.schemas import Document, DocumentMetadata, Job, ObjectRef
+
+    r = make_run(tmp_path)
+    meta = DocumentMetadata(filename="a.pdf", sha256="0" * 64, page_count=1, encrypted=False, has_text_layer=True)
+    doc = Document(metadata=meta, pdf=ObjectRef(sha256="0" * 64, media_type="application/pdf", size=1))
+    job = Job(id="j1", request_id=r.req.id, document=doc, instructions="q", deadline_at="2030-01-01T00:00:00Z")
+    assert run.run_tool(r, job, "post", {"kind": "note", "pages": [3], "note": "n"}) == [
+        {"type": "text", "text": "posted"}]
+    assert run.run_tool(r, job, "split", {"pages_per_job": 5}) == [{"type": "text", "text": "split requested"}]
+    note, split = r.thread
+    assert (note.thread, note.job_id, note.kind, note.pages, note.note) == (r.req.id, "j1", "note", [3], "n")
+    assert (split.kind, split.pages_per_job) == ("split", 5) and r.events.get_nowait() is split
+
+
 # --- T3 ---
+
+
+class FakeOcrServer:
+    """A llama-server stand-in on a free port: GET /health and POST /v1/chat/completions."""
+
+    def __init__(self, health: int = 200, content: str = "warm", port: int = 0):
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.health, self.content, self.bodies = health, content, []
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def reply(self, code: int, body: dict):
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self.reply(fake.health, {"status": "ok" if fake.health == 200 else "loading"})
+
+            def do_POST(self):
+                fake.bodies.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.reply(200, {"choices": [{"message": {"role": "assistant", "content": fake.content}}]})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def ocr_server():
+    server = FakeOcrServer()
+    yield server
+    server.close()
+
+
+def free_url() -> str:
+    """A URL where nothing listens."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+def image_of(text: str):
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (200, 60), "white")
+    ImageDraw.Draw(image).text((10, 10), text, fill="black", font_size=32)
+    return image
+
+
+@pytest.mark.parametrize("mode,prompt", list(run.OCR_PROMPTS.items()))
+def test_each_mode_gives_its_prompt(ocr_server, mode, prompt):
+    run.PaddleRecognizer(ocr_server.url)(image_of("x"), mode)
+    assert ocr_server.bodies[0]["messages"][0]["content"][-1] == {"type": "text", "text": prompt}
+
+
+def test_request_body_has_image_url_prompt_and_temperature_0(ocr_server):
+    import base64
+
+    from PIL import Image
+
+    out = run.PaddleRecognizer(ocr_server.url)(image_of("x"), "text")
+    assert out == "warm"
+    (body,) = ocr_server.bodies
+    assert body["model"] == "paddleocr-vl" and body["temperature"] == 0 and body["max_tokens"] == 2048
+    (msg,) = body["messages"]
+    image_part, text_part = msg["content"]
+    assert msg["role"] == "user" and text_part == {"type": "text", "text": "OCR:"}
+    url = image_part["image_url"]["url"]
+    assert image_part["type"] == "image_url" and url.startswith("data:image/png;base64,")
+    assert Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).size == (200, 60)
+
+
+def test_table_output_becomes_markdown(ocr_server):
+    ocr_server.content = "<fcel>Item<fcel>Q1<fcel>Q2<nl><fcel>Freight<fcel>1,100<ecel><nl>"
+    assert run.PaddleRecognizer(ocr_server.url)(image_of("x"), "table") == (
+        "| Item | Q1 | Q2 |\n| --- | --- | --- |\n| Freight | 1,100 |  |")
+
+
+def test_otsl_to_markdown():
+    assert run.otsl_to_markdown("<fcel>A<fcel>B<nl><fcel>1<nl>") == "| A | B |\n| --- | --- |\n| 1 |  |"
+    assert run.otsl_to_markdown("<fcel>a|b<lcel><nl>") == "| a\\|b |  |\n| --- | --- |"
+    assert run.otsl_to_markdown("plain text") == "plain text"
+
+
+def test_ensure_ocr_server_returns_at_once_when_health_is_200(ocr_server, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("must not start a server"))
+    seconds = run.ensure_ocr_server(ocr_server.url, timeout_s=5)
+    assert seconds >= 0 and len(ocr_server.bodies) == 1  # one warm-up request
+    assert ocr_server.bodies[0]["messages"][0]["content"][-1]["text"] == "OCR:"
+    assert run.ensure_ocr_server(ocr_server.url) == 0.0 and len(ocr_server.bodies) == 1  # a second call does nothing
+
+
+def test_ensure_ocr_server_starts_the_server_when_it_is_down(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    url = free_url()
+    port = int(url.rsplit(":", 1)[1])
+    started = []
+
+    def fake_popen(cmd, **kwargs):  # the "server" comes up on the port in the command
+        started.append((cmd, FakeOcrServer(port=port)))
+        return object()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    try:
+        assert run.ensure_ocr_server(url, timeout_s=10) >= 0
+    finally:
+        for _, server in started:
+            server.close()
+    (cmd, server), = started
+    assert cmd[1:] == ["serve", "-hf", "PaddlePaddle/PaddleOCR-VL-1.6-GGUF", "--temp", "0",
+                       "--port", str(port), "-np", "4", "--alias", "paddleocr-vl"]
+    assert (tmp_path / "var/log/llama-serve.log").exists() and len(server.bodies) == 1
+
+
+def test_ensure_ocr_server_raises_after_the_timeout(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: object())
+    with pytest.raises(RuntimeError, match="llama-serve.log"):
+        run.ensure_ocr_server(free_url(), timeout_s=0)
+
+
+def test_recognize_runs_the_recognizer_on_a_region(tmp_path, monkeypatch):
+    rec = FakeRecognizer()
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]), recognizer=rec)
+    region = run.render(r, run.Render(page=1, dpi=72))
+    assert run.recognize(r, run.Recognize(region=region.id, mode="table")) == "table:text"
+    assert run.run_tool(r, None, "recognize", {"region": region.id, "mode": "table"}) == [
+        {"type": "text", "text": "table:text"}]
+    (image, mode), = rec.calls  # the second call came from the memo
+    assert mode == "table" and image.size == (612, 792)
+    assert "unknown region" in run.recognize(r, run.Recognize(region="nope", mode="text"))
+
+
+@pytest.mark.skipif(os.environ.get("RUN_LIVE") != "1", reason="needs RUN_LIVE=1 and the local OCR server")
+def test_live_paddle_reads_a_word_from_a_rendered_page(tmp_path, monkeypatch):
+    print(f"ocr_warmup_s={run.ensure_ocr_server():.2f}")
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Invoice"]), recognizer=run.PaddleRecognizer())
+    region = run.render(r, run.Render(page=1, dpi=150))
+    assert "Invoice" in run.recognize(r, run.Recognize(region=region.id, mode="text"))
 
 
 # --- T4 ---
