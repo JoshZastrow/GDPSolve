@@ -164,8 +164,6 @@ STUBS = [
     ("ensure_ocr_server", lambda r: run.ensure_ocr_server()),
     ("PaddleRecognizer", lambda r: run.PaddleRecognizer()(None, "text")),
     ("TinkerPolicy", lambda r: run.TinkerPolicy().step([])),
-    ("run_job", lambda r: run.run_job(r, None)),
-    ("worker", lambda r: run.worker(r)),
     ("plan", lambda r: run.plan(None, r.req)),
     ("react", lambda r: run.react(None, r.req, None, r)),
     ("merge", lambda r: run.merge(None, r.req, {})),
@@ -192,6 +190,136 @@ def test_stub_raises_not_implemented(tmp_path, name, call):
 
 
 # --- T4 ---
+
+
+def make_job(r: run.Run, max_steps: int = 10, pages=None, job_id: str = "j1"):
+    """A Job over a 3-page Document (no real PDF; the T4 tests fake run_tool)."""
+    from datetime import datetime
+
+    from gdpsolve.schemas import Document, DocumentMetadata, Job, ObjectRef
+
+    doc = Document(metadata=DocumentMetadata(filename="a.pdf", sha256="0" * 64, page_count=3, encrypted=False,
+                                             has_text_layer=True),
+                   pdf=ObjectRef(sha256="0" * 64, media_type="application/pdf", size=1))
+    return Job(id=job_id, request_id=r.req.id, document=doc, instructions="Find the total.", pages=pages,
+               max_steps=max_steps, deadline_at=datetime.fromtimestamp(r.deadline))
+
+
+def text_of(message: dict) -> str:
+    content = message["content"]
+    return content if isinstance(content, str) else "".join(p.get("text", "") for p in content)
+
+
+READY = run.Turn("report", {"state": "ready", "summary": "done", "answer": "42"}, 100, 10)
+INSPECT = run.Turn("inspect_pdf", {"page": 1}, 100, 10)
+
+
+@pytest.fixture
+def tool_calls(monkeypatch):
+    """Fake run_tool: records (job id, tool, args) and returns one text part."""
+    calls = []
+
+    def fake(r, job, tool, args):
+        calls.append((job.id, tool, args))
+        return [{"type": "text", "text": f"{tool} result"}]
+
+    monkeypatch.setattr(run, "run_tool", fake)
+    return calls
+
+
+def test_run_job_report_ready_ends_the_job(tmp_path, tool_calls, monkeypatch):
+    steps = []
+    monkeypatch.setattr("gdpsolve.trace.call", lambda kind, **f: steps.append((kind, f)))
+    policy = FakePolicy([INSPECT, READY, INSPECT])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    report = r.reports["j1"]
+    assert report.state == "ready" and report.answer == "42" and report.job_id == "j1"
+    assert len(policy.seen) == 2 and policy.turns == [INSPECT]
+    assert tool_calls == [("j1", "inspect_pdf", {"page": 1})]
+    assert "Find the total." in text_of(policy.seen[0][0])
+    assert "inspect_pdf result" in text_of(policy.seen[1][-1])
+    assert r.cost == pytest.approx(2 * (100 * 0.58 + 10 * 1.44) / 1e6)
+    assert [(k, f["job_id"], f["tool"], f["prompt_tokens"], f["completion_tokens"]) for k, f in steps] == [
+        ("step", "j1", "inspect_pdf", 100, 10), ("step", "j1", "report", 100, 10)]
+
+
+def test_run_job_report_progress_does_not_end_the_job(tmp_path, tool_calls):
+    progress = run.Turn("report", {"state": "progress", "summary": "half"}, 1, 1)
+    policy = FakePolicy([progress, READY])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    assert len(policy.seen) == 2 and r.reports["j1"].state == "ready"
+
+
+def test_run_job_tool_error_becomes_an_observation(tmp_path, monkeypatch):
+    def broken(r, job, tool, args):
+        raise ValueError("page 9 is out of range")
+
+    monkeypatch.setattr(run, "run_tool", broken)
+    policy = FakePolicy([INSPECT, READY])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    assert "page 9 is out of range" in text_of(policy.seen[1][-1])
+    assert r.reports["j1"].state == "ready"
+
+
+def test_run_job_bad_report_args_become_an_observation(tmp_path, tool_calls):
+    bad = run.Turn("report", {"state": "done"}, 1, 1)
+    policy = FakePolicy([bad, READY])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    assert "state" in text_of(policy.seen[1][-1]) and r.reports["j1"].state == "ready"
+
+
+@pytest.mark.parametrize("limit", ["steps", "deadline", "cost"])
+def test_run_job_limit_forces_one_report_turn(tmp_path, tool_calls, limit):
+    policy = FakePolicy([INSPECT, INSPECT, READY])
+    r = make_run(tmp_path, policy=policy, deadline_s=20 if limit == "deadline" else 300)
+    if limit == "cost":
+        r.cost = run.MAX_COST_PER_DOC + 0.01
+    run.run_job(r, make_job(r, max_steps=2))
+    forced_at = 2 if limit == "steps" else 0
+    assert len(policy.seen) == forced_at + 1
+    assert "report" in text_of(policy.seen[forced_at][-1]).lower()
+    assert r.reports["j1"].state == "ready"
+
+
+def test_run_job_writes_failed_report_when_the_forced_turn_does_not_report(tmp_path, tool_calls):
+    policy = FakePolicy([INSPECT, INSPECT])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r, max_steps=1))
+    assert len(policy.seen) == 2 and r.reports["j1"].state == "failed"
+
+
+def test_run_job_shows_other_jobs_messages_but_not_its_own(tmp_path, monkeypatch):
+    def posting(r, job, tool, args):
+        r.post(Message(thread=r.req.id, job_id="other", kind="note", note="table continues on p. 3"))
+        r.post(Message(thread=r.req.id, job_id=job.id, kind="note", note="my own note"))
+        return [{"type": "text", "text": "posted"}]
+
+    monkeypatch.setattr(run, "run_tool", posting)
+    policy = FakePolicy([INSPECT, INSPECT, READY])
+    r = make_run(tmp_path, policy=policy)
+    r.post(Message(thread=r.req.id, job_id="earlier", kind="unrelated", pages=[2], note="cover page"))
+    run.run_job(r, make_job(r))
+    assert "cover page" in text_of(policy.seen[0][0])
+    first, second = text_of(policy.seen[1][-1]), text_of(policy.seen[2][-1])
+    assert "table continues on p. 3" in first and "my own note" not in first and "cover page" not in first
+    assert second.count("table continues on p. 3") == 1  # only the message from the second call
+
+
+def test_worker_runs_jobs_until_none(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(run, "run_job", lambda r, job: ran.append(job.id))
+    r = make_run(tmp_path)
+    for job_id in ["a", "b"]:
+        r.jobs.put(make_job(r, job_id=job_id))
+    r.jobs.put(None)
+    t = threading.Thread(target=run.worker, args=(r,), daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive() and ran == ["a", "b"]
 
 
 # --- T5 ---
