@@ -17,7 +17,7 @@ def metadata(path: Path) -> DocumentMetadata:
         sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         page_count=len(pdf),
         encrypted=False,  # pdfium raises on encrypted PDFs without a password
-        has_text_layer=any(_text(page) for page in pdf),
+        has_text_layer=any(page_text(page) for page in pdf),
         title=info.get("Title"),
         author=info.get("Author"),
         producer=info.get("Producer"),
@@ -33,7 +33,7 @@ def content(path: Path, count_tokens: Callable[[list[dict]], int], budget: int =
     parts: list[dict] = []
     used = 0
     for n, page in enumerate(pdfium.PdfDocument(path), start=1):
-        text = _text(page)
+        text = page_text(page)
         if text:
             page_parts = [{"type": "text", "text": f"--- page {n} ---\n{text}"}]
         else:
@@ -47,5 +47,5 @@ def content(path: Path, count_tokens: Callable[[list[dict]], int], budget: int =
     return parts, None
 
 
-def _text(page: pdfium.PdfPage) -> str:
+def page_text(page: pdfium.PdfPage) -> str:
     return page.get_textpage().get_text_bounded().strip()
