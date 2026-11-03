@@ -4,6 +4,8 @@ Each task adds its tests only in its own `# --- T<n> ---` section.
 """
 
 import io
+import json
+import os
 import threading
 import time
 
@@ -163,7 +165,6 @@ STUBS = [
     ("run_tool", lambda r: run.run_tool(r, None, "inspect_pdf", {"page": 1})),
     ("ensure_ocr_server", lambda r: run.ensure_ocr_server()),
     ("PaddleRecognizer", lambda r: run.PaddleRecognizer()(None, "text")),
-    ("TinkerPolicy", lambda r: run.TinkerPolicy().step([])),
     ("plan", lambda r: run.plan(None, r.req)),
     ("react", lambda r: run.react(None, r.req, None, r)),
     ("merge", lambda r: run.merge(None, r.req, {})),
@@ -326,6 +327,102 @@ def test_worker_runs_jobs_until_none(tmp_path, monkeypatch):
 
 
 # --- T6 ---
+
+V0_TOOLS = ["inspect_pdf", "read_native_text", "render", "crop", "recognize", "split", "post", "report"]
+
+
+def test_tool_specs_come_from_toolbox():
+    from gdpsolve.schemas import TOOLBOX
+
+    specs = run.tool_specs()
+    assert [s["name"] for s in specs] == V0_TOOLS
+    for s in specs:
+        assert s["parameters"] == TOOLBOX[s["name"]].model_json_schema() and s["description"]
+
+
+@pytest.fixture
+def tml_renderer():
+    """The real tml_v0 renderer for MODEL; skips when the tokenizer cannot be loaded (offline, no cache)."""
+    try:
+        from tinker_cookbook import renderers
+        from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+        return renderers.get_renderer("tml_v0", get_tokenizer(run.MODEL))
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"tml_v0 tokenizer unavailable: {e}")
+
+
+class FakeClient:
+    """A Tinker sampling client that returns fixed tokens. Records each (prompt, sampling_params)."""
+
+    def __init__(self, tokens: list[int]):
+        self.tokens = tokens
+        self.calls = []
+
+    def sample(self, prompt, num_samples, sampling_params):
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+
+        self.calls.append((prompt, sampling_params))
+        future = Future()
+        future.set_result(SimpleNamespace(sequences=[SimpleNamespace(tokens=self.tokens)]))
+        return future
+
+
+def completion_tokens(renderer, assistant: dict) -> list[int]:
+    """The tokens the model would sample for `assistant`: the trained part of an SFT example."""
+    model_input, weights = renderer.build_supervised_example([{"role": "user", "content": "hi"}, assistant])
+    tokens = [t for chunk in model_input.chunks for t in chunk.tokens]
+    return [t for t, w in zip(tokens, weights.tolist(), strict=True) if w > 0]
+
+
+def policy_with(renderer, tokens: list[int]) -> run.TinkerPolicy:
+    policy = run.TinkerPolicy()
+    policy.renderer, policy.client = renderer, FakeClient(tokens)
+    return policy
+
+
+def test_tinker_policy_parses_a_tool_call_into_a_turn(tml_renderer):
+    from gdpsolve import trace
+
+    args = {"page": 2, "bbox": {"page": 2, "x0": 0, "y0": 0, "x1": 100, "y1": 50}, "dpi": 300}
+    call = {"id": "c1", "type": "function", "function": {"name": "crop", "arguments": json.dumps(args)}}
+    tokens = completion_tokens(tml_renderer, {"role": "assistant", "content": "", "tool_calls": [call]})
+    policy = policy_with(tml_renderer, tokens)
+    turn = policy.step([{"role": "user", "content": [{"type": "text", "text": "Crop the table."}]}])
+    prompt, params = policy.client.calls[0]
+    assert turn == run.Turn("crop", args, prompt.length, len(tokens))
+    assert params.max_tokens == run.MAX_TOKENS == 4096
+    text = trace.prompt_text(tml_renderer.tokenizer, prompt)
+    assert "Thinking effort level: 0.3" in text and "Crop the table." in text
+    assert all(f'"name":"{name}"' in text for name in V0_TOOLS) and "detect_layout" not in text
+
+
+def test_tinker_policy_without_a_tool_call_gives_a_failed_report(tml_renderer):
+    tokens = completion_tokens(tml_renderer, {"role": "assistant", "content": "The total is 42."})
+    turn = policy_with(tml_renderer, tokens).step([{"role": "user", "content": "q"}])
+    assert turn.tool == "report" and turn.args["state"] == "failed" and turn.args["answer"] == "The total is 42."
+
+
+def test_tinker_policy_step_cost(tmp_path, tml_renderer, monkeypatch):
+    tokens = completion_tokens(tml_renderer, {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "report",
+                                                      "arguments": json.dumps({"state": "ready", "summary": "s"})}}]})
+    policy = policy_with(tml_renderer, tokens)
+    monkeypatch.setattr(run, "run_tool", lambda *a: [])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    prompt, _ = policy.client.calls[0]
+    assert r.reports["j1"].state == "ready"
+    assert r.cost == pytest.approx((prompt.length * 0.58 + len(tokens) * 1.44) / 1e6)
+
+
+@pytest.mark.skipif(not os.environ.get("RUN_LIVE"), reason="live Tinker call; set RUN_LIVE=1")
+def test_tinker_policy_live():
+    turn = run.TinkerPolicy().step([{"role": "user", "content": [{"type": "text", "text":
+                                     "The document has 1 page. Inspect page 1 with the inspect_pdf tool."}]}])
+    print(turn, f"cost ${(turn.prompt_tokens * 0.58 + turn.completion_tokens * 1.44) / 1e6:.5f}")
+    assert turn.tool in V0_TOOLS and turn.prompt_tokens > 0 and turn.completion_tokens > 0
 
 
 # --- T7 ---
