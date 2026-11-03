@@ -274,12 +274,12 @@ def test_run_job_bad_report_args_become_an_observation(tmp_path, tool_calls):
 
 @pytest.mark.parametrize("limit", ["steps", "deadline", "cost"])
 def test_run_job_limit_forces_one_report_turn(tmp_path, tool_calls, limit):
-    policy = FakePolicy([INSPECT, INSPECT, READY])
+    forced_at = 2 if limit == "steps" else 0
+    policy = FakePolicy([INSPECT] * forced_at + [READY])
     r = make_run(tmp_path, policy=policy, deadline_s=20 if limit == "deadline" else 300)
     if limit == "cost":
         r.cost = run.MAX_COST_PER_DOC + 0.01
     run.run_job(r, make_job(r, max_steps=2))
-    forced_at = 2 if limit == "steps" else 0
     assert len(policy.seen) == forced_at + 1
     assert "report" in text_of(policy.seen[forced_at][-1]).lower()
     assert r.reports["j1"].state == "ready"
