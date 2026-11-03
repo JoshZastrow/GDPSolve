@@ -212,3 +212,14 @@ def test_benchmark_makes_one_env_per_dev_row(var):
     assert result.metrics["rubric_score"] == pytest.approx(0.75)
     assert result.metrics["truncated"] == pytest.approx(0.5)
     assert result.metrics["grader_tokens_total"] == 400
+
+
+def test_headroom_per_step_from_rollout_records():
+    def rec(it, g, r):
+        return {"split": "train", "iteration": it, "group_idx": g, "traj_idx": 0, "total_reward": r}
+
+    records = [rec(1, 0, 0.2), rec(1, 0, 0.6), rec(1, 1, 0.5), rec(1, 1, 0.505),
+               rec(2, 0, 1.0), rec(2, 0, 0.0)]
+    steps = docqa.headroom(records)
+    assert steps[1] == pytest.approx({"mean@k": 0.45125, "max@k": (0.6 + 0.505) / 2, "frac_equal": 0.5, "groups": 2})
+    assert steps[2] == pytest.approx({"mean@k": 0.5, "max@k": 1.0, "frac_equal": 0.0, "groups": 1})
