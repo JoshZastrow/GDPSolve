@@ -174,15 +174,62 @@ class Policy(Protocol):
     def step(self, messages: list) -> Turn: ...
 
 
+TOOLS = ["inspect_pdf", "read_native_text", "render", "crop", "recognize", "split", "post", "report"]  # v0 TOOLBOX subset
+
+
+def tool_specs() -> list[dict]:
+    """The v0 tool specs: each TOOLBOX model's docstring and JSON Schema."""
+    from gdpsolve.schemas import TOOLBOX
+
+    return [{"name": name, "description": TOOLBOX[name].__doc__.strip(), "parameters": TOOLBOX[name].model_json_schema()}
+            for name in TOOLS]
+
+
 class TinkerPolicy:
-    """MODEL with the tml_v0 renderer; the tool specs are the TOOLBOX JSON Schemas."""
+    """MODEL with the tml_v0 renderer; the tool specs are the TOOLBOX JSON Schemas.
+
+    `step` takes the cookbook Message dicts that run_job makes (see the worker section). It uses the first tool
+    call of the completion. A completion without a tool call becomes a failed `report` with its text as the answer.
+    The renderer and the sampling client are made at the first step; the client is shared by the worker threads.
+    """
 
     def __init__(self, model: str = MODEL):
         self.model = model
+        self.renderer = None
+        self.client = None
+        self._lock = threading.Lock()
+
+    def _setup(self) -> None:
+        import tinker
+        from tinker_cookbook import renderers
+        from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+        with self._lock:
+            if self.renderer is None:
+                self.renderer = renderers.get_renderer("tml_v0", get_tokenizer(self.model))
+            if self.client is None:
+                self.client = tinker.ServiceClient().create_sampling_client(base_model=self.model)
 
     def step(self, messages: list) -> Turn:
         """Sample one turn (EFFORT, MAX_TOKENS) and parse its tool call."""
-        raise NotImplementedError
+        import json
+
+        import tinker
+        from tinker_cookbook import renderers
+
+        if self.renderer is None or self.client is None:
+            self._setup()
+        prefix = self.renderer.create_conversation_prefix_with_tools(tool_specs())
+        prompt = self.renderer.build_generation_prompt(prefix + messages, effort=EFFORT)
+        params = tinker.SamplingParams(max_tokens=MAX_TOKENS, stop=self.renderer.get_stop_sequences())
+        tokens = self.client.sample(prompt, num_samples=1, sampling_params=params).result().sequences[0].tokens
+        message, _ = self.renderer.parse_response(tokens)
+        if calls := message.get("tool_calls"):
+            tool, args = calls[0].function.name, json.loads(calls[0].function.arguments)
+        else:
+            tool = "report"
+            args = {"state": "failed", "summary": "no tool call", "answer": renderers.get_text_content(message)}
+        return Turn(tool, args, prompt.length, len(tokens))
 
 
 # --- worker ---
