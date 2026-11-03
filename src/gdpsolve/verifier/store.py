@@ -1,6 +1,8 @@
 """Content-addressed object store: var/objects/<sha256>."""
 
 import hashlib
+import os
+import threading
 from pathlib import Path
 
 from gdpsolve.schemas import ObjectRef
