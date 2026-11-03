@@ -131,14 +131,17 @@ def page_pairs(targets: list[Path], seed: int) -> list[tuple[Path, Path]]:
 
 
 def merge(paths: list[Path]) -> bytes:
-    """One PDF with the pages of `paths`, in order."""
-    from pypdf import PdfWriter
+    """One PDF with the pages of `paths`, in order. pdfium, as the parser: pypdf fails on some ParseBench files."""
+    import pypdfium2 as pdfium
 
-    writer = PdfWriter()
+    out = pdfium.PdfDocument.new()
     for path in paths:
-        writer.append(str(path))
+        src = pdfium.PdfDocument(path)
+        out.import_pages(src)
+        src.close()
     buf = io.BytesIO()
-    writer.write(buf)
+    out.save(buf)
+    out.close()
     return buf.getvalue()
 
 

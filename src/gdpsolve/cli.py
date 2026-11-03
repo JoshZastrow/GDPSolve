@@ -107,15 +107,21 @@ def synth_docqa(
     prefill = sum(p.length for p in prompts)
     typer.echo(f"{len(pairs)} pairs ({len(targets)} target pages, {len(pool)} pages): {prefill:,} prompt tokens",
                err=True)
+    cache = docqa.OUT / "teacher.jsonl"
+    cached = docqa.read_jsonl(cache) if cache.exists() else []
+    if [r["pair"] for r in cached] == [[str(p) for p in pair] for pair in pairs]:
+        typer.echo(f"reusing the teacher answers in {cache} (no Tinker calls)", err=True)
+        counts = docqa.build(pairs, pool, [r["answer"] for r in cached], seed)
+        return typer.echo(f"{counts} -> {docqa.OUT}")
     _guard(docqa.cost(docqa.TEACHER, prefill=prefill, sample=800 * len(prompts)), _remaining(budget))
     answers = asyncio.run(docqa.ask_teacher(renderer, prompts))
-    docqa.write_jsonl(docqa.OUT / "teacher.jsonl", [{"pair": [str(p) for p in pair], "answer": a, "tokens": t}
-                                                    for pair, (a, t) in zip(pairs, answers, strict=True)])
+    docqa.write_jsonl(cache, [{"pair": [str(p) for p in pair], "answer": a, "tokens": t}
+                              for pair, (a, t) in zip(pairs, answers, strict=True)])
     sample = sum(t for _, t in answers)
-    counts = docqa.build(pairs, pool, [a for a, _ in answers], seed)
     usd = docqa.cost(docqa.TEACHER, prefill=prefill, sample=sample)
     total = docqa.log_spend("synth docqa", usd, model=docqa.TEACHER, prefill_tokens=prefill, sample_tokens=sample,
-                            **counts)
+                            n=len(pairs))
+    counts = docqa.build(pairs, pool, [a for a, _ in answers], seed)
     typer.echo(f"{counts} -> {docqa.OUT}; ${usd:.2f} (total ${total:.2f})")
 
 

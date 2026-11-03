@@ -62,7 +62,8 @@ def test_bundle_has_six_pages_two_targets_and_is_deterministic(tmp_path):
     assert [o["source"] for o in order] == [f"pages/{t}.pdf" for t in texts]
     assert [o["target"] for o in order].count(True) == 2
     assert [o["page"] for o in order] == [1, 2, 3, 4, 5, 6]
-    assert docqa.make_bundle(targets, pool, seed="docqa-0-0001") == (pdf, order)
+    again, again_order = docqa.make_bundle(targets, pool, seed="docqa-0-0001")
+    assert page_texts(again) == texts and again_order == order  # the bytes hold a creation date
     orders = {tuple(o["source"] for o in docqa.make_bundle(targets, pool, seed=f"s{i}")[1]) for i in range(5)}
     assert len(orders) > 1
 
