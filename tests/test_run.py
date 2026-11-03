@@ -157,17 +157,6 @@ def test_config():
     assert run.OCR_PROMPTS["symbol"] == "Spotting:"
 
 
-STUBS = [
-    ("run_eval", lambda r: run.run_eval([], r.req.path.parent, r.req.path.parent / "results.jsonl")),
-]
-
-
-@pytest.mark.parametrize("name,call", STUBS, ids=[s[0] for s in STUBS])
-def test_stub_raises_not_implemented(tmp_path, name, call):
-    with pytest.raises(NotImplementedError):
-        call(make_run(tmp_path))
-
-
 # --- T1 ---
 
 
@@ -972,3 +961,125 @@ def test_tinker_policy_live():
 
 
 # --- T7 ---
+
+
+class ReadPolicy:
+    """Each job reads page 1, then reports ready with the answer "42"."""
+
+    def __init__(self):
+        self.steps = 0
+
+    def step(self, messages: list) -> run.Turn:
+        self.steps += 1
+        if not any(m["role"] == "assistant" for m in messages):
+            return run.Turn("read_native_text", {"page": 1}, 100, 10)
+        return run.Turn("report", {"state": "ready", "summary": "done", "answer": "42"}, 100, 10)
+
+
+@pytest.fixture
+def fake_models(monkeypatch):
+    """ReadPolicy for TinkerPolicy, FakeRecognizer for PaddleRecognizer, and a recorded ensure_ocr_server."""
+    policy, started = ReadPolicy(), []
+    monkeypatch.setattr(run, "TinkerPolicy", lambda: policy)
+    monkeypatch.setattr(run, "PaddleRecognizer", FakeRecognizer)
+    monkeypatch.setattr(run, "ensure_ocr_server", lambda: started.append(1) or 0.0)
+    return policy, started
+
+
+@pytest.fixture
+def gdp_data(tmp_path, monkeypatch):
+    """A 2-task GDP.pdf directory in tmp_path/data (load_tasks faked); cwd is tmp_path for the store."""
+    from gdpsolve import cli
+
+    monkeypatch.chdir(tmp_path)
+    data = tmp_path / "data"
+    data.mkdir()
+    (data / "a.pdf").write_bytes(make_pdf(["Total 42"]))
+    (data / "b.pdf").write_bytes(make_pdf(["Total 42", "Page two"]))
+    tasks = [{"task_id": f"t{i}", "pdf_path": name, "prompt": "What is the total?", "rubric - 1. criterion": "Says 42"}
+             for i, name in enumerate(["a.pdf", "b.pdf"], 1)]
+    monkeypatch.setattr(cli.gdp_pdf, "load_tasks", lambda data=None: tasks)
+    return data
+
+
+def eval_process(data, out, *args):
+    from typer.testing import CliRunner
+
+    from gdpsolve import cli
+
+    return CliRunner().invoke(cli.app, ["eval", "gdp-pdf", "--system", "process", "--data", str(data),
+                                        "--out", str(out), *args])
+
+
+def test_eval_process_writes_baseline_rows(tmp_path, gdp_data, fake_models):
+    from gdpsolve.eval import baseline
+
+    _, started = fake_models
+    result = eval_process(gdp_data, tmp_path / "out")
+    assert result.exit_code == 0, result.output
+    rows = baseline.done(tmp_path / "out" / "results.jsonl")
+    assert list(rows) == ["t1", "t2"] and started == [1]
+    for row, pages in zip(rows.values(), [1, 2], strict=True):
+        assert row["status"] == "ok" and row["answer"] == "42" and row["document"]["page_count"] == pages
+        assert row["model"] == run.MODEL and row["effort"] == run.EFFORT and row["truncated_at_page"] is None
+        assert row["steps"] == 2 and row["jobs"] == 1 and row["latency_s"] >= 0
+        assert row["cost"] == pytest.approx(2 * (100 * 0.58 + 10 * 1.44) / 1e6)
+    assert (tmp_path / "out" / "process" / "metrics.jsonl").exists()
+
+
+def test_eval_process_resumes_and_limits(tmp_path, gdp_data, fake_models):
+    policy, _ = fake_models
+    assert eval_process(gdp_data, tmp_path / "out", "--limit", "1").exit_code == 0
+    assert policy.steps == 2
+    assert eval_process(gdp_data, tmp_path / "out").exit_code == 0
+    lines = (tmp_path / "out" / "results.jsonl").read_text().splitlines()
+    assert [json.loads(line)["request_id"] for line in lines] == ["t1", "t2"] and policy.steps == 4
+
+
+def test_eval_process_budget_guard(tmp_path, gdp_data, fake_models):
+    policy, _ = fake_models
+    result = eval_process(gdp_data, tmp_path / "out", "--budget", "0.2")  # 2 tasks x $0.15 > $0.20
+    assert result.exit_code == 1 and policy.steps == 0
+    assert not (tmp_path / "out" / "results.jsonl").exists()
+
+
+def test_score_gdp_pdf_reads_process_rows(tmp_path, gdp_data, fake_models):
+    from typer.testing import CliRunner
+
+    from gdpsolve import cli
+
+    assert eval_process(gdp_data, tmp_path / "out").exit_code == 0
+    result = CliRunner().invoke(cli.app, ["score", "gdp-pdf", str(tmp_path / "out" / "results.jsonl"),
+                                          "--data", str(gdp_data), "--budget", "0"])  # stops before the judge
+    assert result.exit_code == 1 and "2 tasks, 2 judge calls" in result.output
+
+
+def test_extract_prints_one_result_per_pdf(tmp_path, fake_models, monkeypatch):
+    from typer.testing import CliRunner
+
+    from gdpsolve import cli
+    from gdpsolve.schemas import ExtractionResult
+
+    monkeypatch.chdir(tmp_path)
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "a.pdf").write_bytes(make_pdf(["Total 42"]))
+    (docs / "b.pdf").write_bytes(make_encrypted(make_pdf(["Total 42"]), "pw"))
+    (docs / "notes.txt").write_text("not a pdf")
+    result = CliRunner().invoke(cli.app, ["extract", str(docs), "-i", "What is the total?", "--password", "pw"])
+    assert result.exit_code == 0, result.output
+    results = [ExtractionResult.model_validate_json(line) for line in result.stdout.splitlines()]
+    assert [(r.document.filename, r.status, r.answer) for r in results] == [("a.pdf", "ok", "42"), ("b.pdf", "ok", "42")]
+    assert results[1].document.encrypted
+
+
+def test_extract_one_pdf(tmp_path, fake_models, monkeypatch):
+    from typer.testing import CliRunner
+
+    from gdpsolve import cli
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.pdf").write_bytes(make_pdf(["Total 42"]))
+    result = CliRunner().invoke(cli.app, ["extract", str(tmp_path / "a.pdf"), "-i", "What is the total?"])
+    assert result.exit_code == 0, result.output
+    assert [json.loads(line)["answer"] for line in result.stdout.splitlines()] == ["42"]
