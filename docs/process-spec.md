@@ -98,7 +98,7 @@ def process(req, policy=None, recognizer=None, workers=4) -> ExtractionResult:
         run.put_merge_job_when_children_ended()
     for _ in threads:
         run.jobs.put(None)                # stop signal
-    return merge(doc, req, run.reports)
+    return merge(doc, req, run.reports, run.final_id, root_id)
 ```
 
 `Run` holds the state of one request:
@@ -236,8 +236,8 @@ Give the model the prompt for the mode:
   - Make child jobs of at least 5 pages each. Make no more than 16 child jobs.
   - Make one `merge` job with `after` set to the child jobs. Put it in the queue only when all child jobs have ended.
   - If less than 120 s is left, return `[]`.
-- `merge(doc, req, reports) -> ExtractionResult`. Do not call a model.
-  1. If the merge job has a `ready` report, use its answer and fields.
+- `merge(doc, req, reports, final_id, root_id) -> ExtractionResult`. Do not call a model.
+  1. If the final job (`final_id`: the merge job after a split, else the root job) has a `ready` report, use its answer and fields.
   2. If not, and the root job has a `ready` report, use the root report.
   3. If not, join the answers of the `ready` reports. Set `status="partial"`.
   4. If no report is `ready`, set `status="failed"`.

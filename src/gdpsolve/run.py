@@ -100,11 +100,21 @@ class Run:
 
     def final_ended(self) -> bool:
         """True when the job `final_id` has a ready or failed report."""
-        raise NotImplementedError
+        report = self.reports.get(self.final_id)
+        return report is not None and report.state in ("ready", "failed")
 
     def put_merge_job_when_children_ended(self) -> None:
-        """Move each waiting job whose `after` jobs have all ended to `jobs`."""
-        raise NotImplementedError
+        """Move each waiting job whose `after` jobs have all ended to `jobs`, with their reports in its instructions."""
+        for job in list(self.waiting):
+            reports = [self.reports.get(i) for i in job.after]
+            if not all(r is not None and r.state in ("ready", "failed") for r in reports):
+                continue
+            lines = "\n".join(f"- job {r.job_id} ({r.state}): {r.summary}" + (f"\n  {r.answer}" if r.answer else "")
+                              for r in reports)
+            with self.lock:
+                self.waiting.remove(job)
+            self.jobs.put(job.model_copy(update={"instructions": f"{job.instructions}\n\nReports of the child jobs:\n"
+                                                                 f"{lines}\n\nMerge them into the final answer."}))
 
 
 # --- ingest ---
@@ -288,8 +298,6 @@ def run_tool(run: Run, job: Job, tool: str, args: dict) -> list[dict]:
         a = Post.model_validate(args)
         run.post(Message(thread=run.req.id, job_id=job.id, kind=a.kind, pages=a.pages, note=a.note))
         return [{"type": "text", "text": "posted"}]
-    if tool == "report":
-        raise NotImplementedError("report: hook for the worker task (T4)")
     raise ValueError(f"unknown tool: {tool}")
 
 
@@ -580,19 +588,77 @@ def worker(run: Run) -> None:
 # --- router ---
 
 
+MIN_PAGES_PER_CHILD = 5
+MAX_CHILDREN = 16
+MIN_SPLIT_TIME_S = 120
+
+
+def _max_steps(page_count: int) -> int:
+    return min(40, 8 + page_count // 5)
+
+
 def plan(doc: Document, req: ExtractionRequest) -> Job:
     """One root job for all pages; max_steps = min(40, 8 + page_count // 5)."""
-    raise NotImplementedError
+    from datetime import datetime, timedelta
+
+    return Job(request_id=req.id, document=doc, instructions=req.instructions,
+               max_steps=_max_steps(doc.metadata.page_count),
+               deadline_at=datetime.now() + timedelta(seconds=req.deadline_s))
 
 
 def react(doc: Document, req: ExtractionRequest, msg: Message | None, run: Run) -> list[Job]:
-    """For a split message: child jobs, and a merge job put in `run.waiting`; else []."""
-    raise NotImplementedError
+    """For a split message: child jobs, and a merge job put in `run.waiting`; else [].
+
+    Only the final job may split, and only once (the merge job id ends in ".merge"). The children cover the split's
+    pages, or all pages, in equal runs of at least MIN_PAGES_PER_CHILD pages; at most MAX_CHILDREN. A split with
+    less than MIN_SPLIT_TIME_S left, or too few pages for two children, gives [].
+    """
+    from datetime import datetime
+    from itertools import pairwise
+
+    if (msg is None or msg.kind != "split" or msg.job_id != run.final_id or run.final_id.endswith(".merge")
+            or run.deadline - time.time() < MIN_SPLIT_TIME_S):
+        return []
+    pages = msg.pages or list(range(1, doc.metadata.page_count + 1))
+    size = max(MIN_PAGES_PER_CHILD, msg.pages_per_job or MIN_PAGES_PER_CHILD)
+    n = min(MAX_CHILDREN, len(pages) // size)
+    if n < 2:
+        return []
+    deadline_at = datetime.fromtimestamp(run.deadline)
+    bounds = [len(pages) * i // n for i in range(n + 1)]
+    children = [Job(id=f"{msg.job_id}.{i}", request_id=req.id, parent_id=msg.job_id, document=doc,
+                    instructions=req.instructions, pages=pages[lo:hi], max_steps=_max_steps(hi - lo),
+                    deadline_at=deadline_at)
+                for i, (lo, hi) in enumerate(pairwise(bounds))]
+    merge_job = Job(id=f"{msg.job_id}.merge", request_id=req.id, parent_id=msg.job_id, kind="merge", document=doc,
+                    instructions=req.instructions, after=[c.id for c in children],
+                    max_steps=_max_steps(doc.metadata.page_count), deadline_at=deadline_at)
+    with run.lock:
+        run.waiting.append(merge_job)
+        run.final_id = merge_job.id
+    return children
 
 
-def merge(doc: Document, req: ExtractionRequest, reports: dict[str, Report]) -> ExtractionResult:
-    """The result from the ready reports, without a model call."""
-    raise NotImplementedError
+def merge(doc: Document, req: ExtractionRequest, reports: dict[str, Report], final_id: str,
+          root_id: str) -> ExtractionResult:
+    """The result from the ready reports, without a model call.
+
+    The final job's ready report, else the root job's, else the ready answers joined ("partial"), else "failed".
+    """
+    ready = [r for r in reports.values() if r.state == "ready"]
+    by_id = {r.job_id: r for r in ready}
+    if final_id in by_id or root_id in by_id:
+        best = by_id.get(final_id) or by_id[root_id]
+        status, answer, fields = "ok", best.answer, best.fields
+    elif ready:
+        status = "partial"
+        answer = "\n\n".join(r.answer for r in ready if r.answer)
+        fields = [f for r in ready for f in r.fields]
+    else:
+        return ExtractionResult(request_id=req.id, document=doc.metadata, status="failed",
+                                error="; ".join(r.error or r.summary for r in reports.values()) or "no report")
+    return ExtractionResult(request_id=req.id, document=doc.metadata, status=status, answer=answer, fields=fields,
+                            confidence=min((f.confidence for f in fields), default=0.0))
 
 
 # --- process ---
@@ -600,8 +666,38 @@ def merge(doc: Document, req: ExtractionRequest, reports: dict[str, Report]) -> 
 
 def process(req: ExtractionRequest, policy: Policy | None = None,
             recognizer: Callable[[Image.Image, str], str] | None = None, workers: int = 4) -> ExtractionResult:
-    """Ingest, run the router and the worker threads until the final job ends or the deadline, then merge."""
-    raise NotImplementedError
+    """Ingest, run the router and the worker threads until the final job ends or the deadline, then merge.
+
+    The OCR server is started only for the default recognizer.
+    """
+    doc = ingest(req)
+    if not isinstance(doc, Document):
+        return doc
+    if recognizer is None:
+        ensure_ocr_server()
+        recognizer = PaddleRecognizer()
+    run = Run(doc, req, policy or TinkerPolicy(), recognizer)
+    root = plan(doc, req)
+    run.final_id = root.id
+    threads = [threading.Thread(target=worker, args=(run,), daemon=True) for _ in range(workers)]
+    for t in threads:
+        t.start()
+    run.jobs.put(root)
+    # A job posts its split before it reports, so a non-empty `events` means a split is still to come.
+    while time.time() < run.deadline and not (run.final_ended() and run.events.empty()):
+        try:
+            msg = run.events.get(timeout=1)
+        except queue.Empty:
+            msg = None
+        for job in react(doc, req, msg, run):
+            run.jobs.put(job)
+        run.put_merge_job_when_children_ended()
+    for _ in threads:
+        run.jobs.put(None)
+    end = time.time() + 1
+    for t in threads:
+        t.join(timeout=max(0.0, end - time.time()))
+    return merge(doc, req, run.reports, run.final_id, root.id)
 
 
 # --- eval ---
