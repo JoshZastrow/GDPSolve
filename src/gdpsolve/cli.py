@@ -156,10 +156,15 @@ def eval_docqa(
     client = (service.create_sampling_client(model_path=checkpoint) if checkpoint
               else service.create_sampling_client(base_model=model))
     # temperature 1: the service samples with Tinker's default temperature
-    cfg = BenchmarkConfig(save_dir=f"var/train/evals/{name}", max_tokens=max_tokens, temperature=1.0,
-                          concurrency=concurrency, timeout_seconds=docqa.DocQABenchmark.recommended_timeout)
+    # no save_dir: saving a trajectory decodes its prompt, which fails on image pages and zeroes the example
+    cfg = BenchmarkConfig(max_tokens=max_tokens, temperature=1.0, concurrency=concurrency,
+                          timeout_seconds=docqa.DocQABenchmark.recommended_timeout)
     result = asyncio.run(run_benchmark(docqa.DocQABenchmark.name, client, renderer, cfg))
     m = result.metrics
+    out = Path("var/train/evals") / name
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "result.json").write_text(json.dumps({"checkpoint": checkpoint, "model": model, "score": result.score,
+                                                 "num_errors": result.num_errors, "metrics": m}, indent=2))
     usd = (docqa.cost(model, prefill=m["total_ob_tokens"], sample=m["total_ac_tokens"])
            + docqa.cost(docqa.GRADER, prefill=m["grader_tokens_total"]))
     total = docqa.log_spend(f"eval docqa {name}", usd, model=model, checkpoint=checkpoint, score=result.score)
@@ -177,10 +182,11 @@ def train_docqa(
     groups_per_batch: Annotated[int, typer.Option(help="Tasks per step.")] = 12,
     group_size: Annotated[int, typer.Option(help="Rollouts per task (advantages centered per task).")] = 4,
     lr: Annotated[float | None, typer.Option(help="Learning rate; default train.learning_rate().")] = None,
+    every: Annotated[int, typer.Option(help="Dev eval and checkpoint every N steps.")] = 2,
     step_usd: Annotated[float, typer.Option(help="Expected cost of one step, for the budget check.")] = 1.2,
     budget: Budget = 10.0,
 ) -> None:
-    """Async RL of Inkling-Small on var/docqa/train.jsonl, dev benchmark every 4 steps (docs/training.md)."""
+    """Async RL of Inkling-Small on var/docqa/train.jsonl, dev benchmark every --every steps (docs/training.md)."""
     from tinker_cookbook import checkpoint_utils
 
     from gdpsolve import docqa, train
@@ -194,7 +200,7 @@ def train_docqa(
     _guard(steps * step_usd, _remaining(budget))
     lr = lr or train.learning_rate()
     typer.echo(f"learning rate {lr:.3g}; steps {end - steps}..{end} -> {log_path}", err=True)
-    train.run(train.config(str(log_path), lr, groups_per_batch, group_size, max_steps))
+    train.run(train.config(str(log_path), lr, groups_per_batch, group_size, max_steps, every=every))
 
     usd = sum(docqa.rl_cost(r) for r in docqa.read_jsonl(metrics)[before:])
     total = docqa.log_spend(f"train docqa {run}", usd, lr=lr, groups_per_batch=groups_per_batch,
