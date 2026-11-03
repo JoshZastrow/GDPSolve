@@ -148,3 +148,15 @@ def test_trace_writes_run_files(tmp_path):
     assert [c["id"] for c in calls] == ["c1"] and calls[0]["kind"] == "verify"
     assert json.loads((tmp_path / "config.json").read_text())["checker"] == "rubric"
     assert "brier_reward" in (tmp_path / "metrics.jsonl").read_text()
+
+
+def test_store_put_replaces_a_truncated_object(tmp_path):
+    import hashlib
+
+    from gdpsolve.verifier import store
+
+    data = b"%PDF-1.7 bytes"
+    (tmp_path / hashlib.sha256(data).hexdigest()).write_bytes(b"")  # left by a write that failed (disk full)
+    ref = store.put(data, "application/pdf", root=tmp_path)
+    assert store.get(ref, root=tmp_path) == data
+    assert [p.name for p in tmp_path.iterdir()] == [ref.sha256]  # no temporary file is left
