@@ -69,12 +69,14 @@ questions about documents.
 Write:
 1. "prompt": a realistic request that a professional (for example a financial analyst, engineer, clinician, \
 lawyer, or policy analyst) would send together with "the attached document". The request must need specific \
-facts from BOTH pages: an analysis, a comparison, a calculation, or a summary. The attached document will also \
-contain other, unrelated pages, so do not mention page numbers and do not say where the facts are.
+facts from BOTH pages: an analysis, a comparison, a calculation, or a summary. Write it in 2 to 5 sentences, \
+the way that person would: state the goal and the deliverable, not a list of the individual values the answer \
+must contain. The attached document will also contain other, unrelated pages, so do not mention page numbers \
+and do not say where the facts are.
 2. "criteria": 6 to 10 grading criteria. Each criterion is one checkable statement that starts with \
-"The response should" and names the specific value or fact from the pages (a number with its unit, a name, a \
-date, or a computed result with its value). Use facts from both pages. A grader will check each criterion \
-against the response alone, without the document.
+"The response should" and names one specific value or fact from the pages (a number with its unit, a name, a \
+date, or a computed result with its value). Use facts from both pages, and only facts that a good answer to \
+the request must contain. A grader will check each criterion against the response alone, without the document.
 
 Return only JSON: {"prompt": "...", "criteria": ["The response should ...", ...]}"""
 
