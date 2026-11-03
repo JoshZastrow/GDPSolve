@@ -169,8 +169,11 @@ def _eval_verifier_gdp_pdf(checker: str, cfg, run: Path, budget: float) -> None:
 
 @eval_app.command("gdp-pdf")
 def eval_gdp_pdf(
-    model: Annotated[str, typer.Option(help="Tinker base model.")] = "thinkingmachines/Inkling-Small",
-    out: Annotated[Path, typer.Option(help="Run directory for results.jsonl.")] = Path("var/runs/m1"),
+    system: Annotated[str, typer.Option(help="baseline (one sample per task) | process (process(): router + "
+                                             "workers).")] = "baseline",
+    model: Annotated[str, typer.Option(help="baseline: Tinker base model.")] = "thinkingmachines/Inkling-Small",
+    out: Annotated[Path | None, typer.Option(help="Run directory for results.jsonl; default var/runs/m1 (baseline) "
+                                                  "or var/runs/m2 (process).")] = None,
     data: Annotated[Path, typer.Option(help="GDP.pdf directory.")] = gdp_pdf.DEFAULT_DIR,
     limit: Annotated[int | None, typer.Option(help="Only the first N tasks.")] = None,
     max_tokens: Annotated[int, typer.Option(help="Completion token cap.")] = 4096,
@@ -178,15 +181,24 @@ def eval_gdp_pdf(
     concurrency: Annotated[int, typer.Option(help="Parallel Tinker requests.")] = 8,
     effort: Annotated[float, typer.Option(help="Reasoning effort for the tml_v0 renderer, in [0, 1).")] = 0.9,
     rerun_truncated: Annotated[bool, typer.Option(help="Also re-answer rows whose answer hit max tokens.")] = False,
+    workers: Annotated[int, typer.Option(help="process: worker threads for each document.")] = 4,
     budget: Budget = 5.0,
 ) -> None:
-    """Baseline answers on GDP.pdf (evaluation only); resumes from results.jsonl."""
+    """Answers on GDP.pdf (evaluation only); resumes from results.jsonl.
+
+    Example: gdpsolve eval gdp-pdf --system process --limit 20 --out var/runs/m2
+    """
     import asyncio
     import json
 
     from gdpsolve.eval import baseline
 
+    if system not in ("baseline", "process"):
+        raise typer.BadParameter("--system must be baseline or process")
     tasks = gdp_pdf.load_tasks(data)[:limit]
+    if system == "process":
+        return _eval_gdp_pdf_process(tasks, out or Path("var/runs/m2"), data, workers, budget)
+    out = out or Path("var/runs/m1")
     out.mkdir(parents=True, exist_ok=True)
     results = out / "results.jsonl"
     todo = baseline.pending(tasks, results, rerun_truncated)
@@ -211,6 +223,55 @@ def eval_gdp_pdf(
                                               for r in new)}
         logger.log_metrics(counts)
     typer.echo(f"{results}: {json.dumps(counts)}")
+
+
+def _eval_gdp_pdf_process(tasks: list[dict], out: Path, data: Path, workers: int, budget: float) -> None:
+    """M2: process() for each task without an ok row; logs status counts, cost, and latency percentiles."""
+    import json
+
+    from gdpsolve import run
+    from gdpsolve.eval import baseline
+
+    out.mkdir(parents=True, exist_ok=True)
+    results = out / "results.jsonl"
+    todo = baseline.pending(tasks, results)
+    typer.echo(f"{len(todo)} tasks to answer ({len(tasks) - len(todo)} done)", err=True)
+    _guard(len(todo) * run.MAX_COST_PER_DOC, budget)
+    dataset = f"{gdp_pdf.DEFAULT_REPO}@{gdp_pdf.DEFAULT_REVISION}"
+    with _traced(out / "process", system="process", model=run.MODEL, effort=run.EFFORT, workers=workers,
+                 max_cost_per_doc=run.MAX_COST_PER_DOC, dataset=dataset) as logger:
+        new = run.run_eval(todo, data, results, workers=workers)
+        ids = {t["task_id"] for t in tasks}
+        rows = [r for r in baseline.done(results).values() if r["request_id"] in ids]
+        latencies = sorted(r["latency_s"] for r in rows if r.get("latency_s") is not None)
+
+        def pct(q: float) -> float | None:
+            return latencies[min(len(latencies) - 1, int(q * len(latencies)))] if latencies else None
+
+        counts = {**{s: sum(r["status"] == s for r in rows) for s in ("ok", "partial", "failed", "password_required")},
+                  "tinker_cost_this_run": sum(r["cost"] for r in new), "latency_p50": pct(0.5),
+                  "latency_p95": pct(0.95)}
+        logger.log_metrics(counts)
+    typer.echo(f"{results}: {json.dumps(counts)}")
+
+
+@app.command("extract")
+def extract(
+    path: Annotated[Path, typer.Argument(help="A PDF, or a directory: one request for each *.pdf in it.")],
+    instructions: Annotated[str, typer.Option("--instructions", "-i", help="What to extract.")],
+    password: Annotated[list[str] | None, typer.Option(help="Password to try; repeat for more.")] = None,
+    workers: Annotated[int, typer.Option(help="Worker threads for each document.")] = 4,
+) -> None:
+    """Run process() on each PDF; one ExtractionResult JSON per line on stdout."""
+    from pydantic import SecretStr
+
+    from gdpsolve import run
+    from gdpsolve.schemas import ExtractionRequest
+
+    pdfs = sorted(path.glob("*.pdf")) if path.is_dir() else [path]
+    for pdf in pdfs:
+        req = ExtractionRequest(path=pdf, instructions=instructions, passwords=[SecretStr(p) for p in password or []])
+        typer.echo(run.process(req, workers=workers).model_dump_json())
 
 
 @score_app.command("gdp-pdf")

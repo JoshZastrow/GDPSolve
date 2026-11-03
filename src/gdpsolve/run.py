@@ -703,7 +703,58 @@ def process(req: ExtractionRequest, policy: Policy | None = None,
 # --- eval ---
 
 
+class _Counted:
+    """Wraps a policy: counts the steps, the jobs (first steps), and the cost of one request."""
+
+    def __init__(self, policy: Policy):
+        self.policy = policy
+        self.steps = self.jobs = 0
+        self.cost = 0.0
+        self._lock = threading.Lock()
+
+    def step(self, messages: list) -> Turn:
+        turn = self.policy.step(messages)
+        with self._lock:
+            self.steps += 1
+            self.jobs += len(messages) == 1
+            self.cost += (turn.prompt_tokens * PRICES["prefill"] + turn.completion_tokens * PRICES["sample"]) / 1e6
+        return turn
+
+
 def run_eval(tasks: list[dict], data: Path, results: Path, policy: Policy | None = None,
-             recognizer: Callable[[Image.Image, str], str] | None = None) -> list[dict]:
-    """process() for each GDP.pdf task; append one baseline-format row (+ steps, cost, jobs) to `results`."""
-    raise NotImplementedError
+             recognizer: Callable[[Image.Image, str], str] | None = None, workers: int = 4) -> list[dict]:
+    """process() for each GDP.pdf task; append one baseline-format row (+ steps, cost, jobs) to `results`.
+
+    Rows are ExtractionResult plus model, effort, truncated_at_page (always None), steps, cost, jobs; each is
+    written when its task ends. The caller picks the tasks (baseline.pending for resume). Returns the new rows.
+    """
+    from gdpsolve import trace
+    from gdpsolve.schemas import DocumentMetadata
+
+    if recognizer is None:
+        ensure_ocr_server()
+        recognizer = PaddleRecognizer()
+    policy = policy or TinkerPolicy()
+    rows = []
+    for task in tasks:
+        path = data / task["pdf_path"]
+        counted = _Counted(policy)
+        start = time.monotonic()
+        try:
+            result = process(ExtractionRequest(id=task["task_id"], path=path, instructions=task["prompt"]),
+                             counted, recognizer, workers)
+        except Exception as e:  # noqa: BLE001 -- recorded as a failed row; resume retries it
+            meta = DocumentMetadata(filename=path.name, sha256="", page_count=0, encrypted=False,
+                                    has_text_layer=False)
+            result = ExtractionResult(request_id=task["task_id"], document=meta, status="failed",
+                                      error=f"{type(e).__name__}: {e}")
+        result.latency_s = round(time.monotonic() - start, 2)
+        row = result.model_dump(mode="json") | {"model": MODEL, "effort": EFFORT, "truncated_at_page": None,
+                                                "steps": counted.steps, "cost": counted.cost, "jobs": counted.jobs}
+        with results.open("a") as f:
+            f.write(json.dumps(row) + "\n")
+        trace.call("process", id=result.request_id, status=result.status, steps=counted.steps, cost=counted.cost,
+                   jobs=counted.jobs, latency_s=result.latency_s, error=result.error)
+        print(f"{result.request_id} {result.status} {result.latency_s}s ${counted.cost:.3f}", flush=True)
+        rows.append(row)
+    return rows
