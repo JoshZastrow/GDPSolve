@@ -17,6 +17,8 @@ eval_app = typer.Typer(no_args_is_help=True, help="Evaluate a system or verifier
 app.add_typer(eval_app, name="eval")
 score_app = typer.Typer(no_args_is_help=True, help="Score responses.")
 app.add_typer(score_app, name="score")
+train_app = typer.Typer(no_args_is_help=True, help="Train a LoRA on Tinker (never on GDP.pdf).")
+app.add_typer(train_app, name="train")
 
 Checker = Annotated[str, typer.Option(help="rubric | support (schemas.CHECKERS).")]
 Checkpoint = Annotated[str | None, typer.Option(help="tinker:// sampler path; default: untrained base model.")]
@@ -77,6 +79,121 @@ def synth_tasks(
     _guard(n * (400 * 0.58 + 1500 * 1.44) / 1e6, budget)  # Inkling-Small prefill/sample $/1M tokens
     counts = synth.build(asyncio.run(synth.generate_tasks(n, seed)), out, seed)
     typer.echo(f"{counts} -> {out}")
+
+
+def _remaining(budget: float) -> float:
+    """The smaller of `budget` and what is left of the training-side Tinker cap (var/train/spend.jsonl)."""
+    from gdpsolve import docqa
+
+    return min(budget, docqa.CAP_USD - docqa.spent())
+
+
+@synth_app.command("docqa")
+def synth_docqa(
+    n: Annotated[int, typer.Option(help="Page pairs to send to the teacher.")] = 340,
+    pages: Annotated[Path, typer.Option(help="ParseBench single-page PDFs (<dir>/{text,table,chart}/*.pdf).")] = Path(
+        "data/parsebench/docs"),
+    seed: int = 0,
+    budget: Budget = 3.0,
+) -> None:
+    """Doc-QA tasks (docs/training.md): 6-page bundles from ParseBench, teacher-written requests and rubrics."""
+    import asyncio
+
+    from gdpsolve import docqa
+
+    targets, pool = docqa.eligible(pages)
+    pairs = docqa.page_pairs(targets, seed)[:n]
+    renderer, prompts = docqa.teacher_prompts(pairs)
+    prefill = sum(p.length for p in prompts)
+    typer.echo(f"{len(pairs)} pairs ({len(targets)} target pages, {len(pool)} pages): {prefill:,} prompt tokens",
+               err=True)
+    _guard(docqa.cost(docqa.TEACHER, prefill=prefill, sample=800 * len(prompts)), _remaining(budget))
+    answers = asyncio.run(docqa.ask_teacher(renderer, prompts))
+    docqa.write_jsonl(docqa.OUT / "teacher.jsonl", [{"pair": [str(p) for p in pair], "answer": a, "tokens": t}
+                                                    for pair, (a, t) in zip(pairs, answers, strict=True)])
+    sample = sum(t for _, t in answers)
+    counts = docqa.build(pairs, pool, [a for a, _ in answers], seed)
+    usd = docqa.cost(docqa.TEACHER, prefill=prefill, sample=sample)
+    total = docqa.log_spend("synth docqa", usd, model=docqa.TEACHER, prefill_tokens=prefill, sample_tokens=sample,
+                            **counts)
+    typer.echo(f"{counts} -> {docqa.OUT}; ${usd:.2f} (total ${total:.2f})")
+
+
+@eval_app.command("docqa")
+def eval_docqa(
+    checkpoint: Checkpoint = None,
+    model: Annotated[str, typer.Option(help="Tinker base model (of the checkpoint).")] = "thinkingmachines/Inkling-Small",
+    name: Annotated[str | None, typer.Option(help="Run name: var/train/evals/<name>.")] = None,
+    max_tokens: Annotated[int, typer.Option(help="Completion token cap, as the service.")] = 8192,
+    concurrency: Annotated[int, typer.Option(help="Parallel rollouts.")] = 16,
+    budget: Budget = 1.5,
+) -> None:
+    """The gdpsolve_docqa dev benchmark (var/docqa/dev.jsonl); prints the score (mean rubric score)."""
+    import asyncio
+    import json
+    import re
+
+    import tinker
+    from tinker_cookbook import model_info, renderers
+    from tinker_cookbook.eval.benchmarks import BenchmarkConfig, run_benchmark
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+    from gdpsolve import docqa
+
+    n = len(docqa.read_jsonl(docqa.OUT / "dev.jsonl"))
+    # about 5k prompt and 3k sampled tokens a task, and 8 grader calls of 1k tokens
+    _guard(n * (docqa.cost(model, prefill=5000, sample=3000) + docqa.cost(docqa.GRADER, prefill=8000)),
+           _remaining(budget))
+    name = name or re.sub(r"[^\w.-]+", "_", checkpoint or model)
+    renderer = renderers.get_renderer(model_info.get_recommended_renderer_name(model), get_tokenizer(model))
+    service = tinker.ServiceClient()
+    client = (service.create_sampling_client(model_path=checkpoint) if checkpoint
+              else service.create_sampling_client(base_model=model))
+    # temperature 1: the service samples with Tinker's default temperature
+    cfg = BenchmarkConfig(save_dir=f"var/train/evals/{name}", max_tokens=max_tokens, temperature=1.0,
+                          concurrency=concurrency, timeout_seconds=docqa.DocQABenchmark.recommended_timeout)
+    result = asyncio.run(run_benchmark(docqa.DocQABenchmark.name, client, renderer, cfg))
+    m = result.metrics
+    usd = (docqa.cost(model, prefill=m["total_ob_tokens"], sample=m["total_ac_tokens"])
+           + docqa.cost(docqa.GRADER, prefill=m["grader_tokens_total"]))
+    total = docqa.log_spend(f"eval docqa {name}", usd, model=model, checkpoint=checkpoint, score=result.score)
+    typer.echo(json.dumps({"name": name, "score": result.score, "rubric_score": m["rubric_score"],
+                           "n": result.num_examples, "errors": result.num_errors, "truncated": m["truncated"],
+                           "completion_tokens": m["completion_tokens"], "usd": round(usd, 4),
+                           "total_usd": round(total, 4)}), err=True)
+    typer.echo(f"{result.score:.4f}")
+
+
+@train_app.command("docqa")
+def train_docqa(
+    run: Annotated[str, typer.Option(help="Run name: var/train/rl/<run>; the same name resumes.")] = "docqa",
+    max_steps: Annotated[int | None, typer.Option(help="Stop at this step (counted from the start of the run).")] = None,
+    groups_per_batch: Annotated[int, typer.Option(help="Tasks per step.")] = 12,
+    group_size: Annotated[int, typer.Option(help="Rollouts per task (advantages centered per task).")] = 4,
+    lr: Annotated[float | None, typer.Option(help="Learning rate; default train.learning_rate().")] = None,
+    step_usd: Annotated[float, typer.Option(help="Expected cost of one step, for the budget check.")] = 1.2,
+    budget: Budget = 10.0,
+) -> None:
+    """Async RL of Inkling-Small on var/docqa/train.jsonl, dev benchmark every 4 steps (docs/training.md)."""
+    from tinker_cookbook import checkpoint_utils
+
+    from gdpsolve import docqa, train
+
+    log_path = Path("var/train/rl") / run
+    metrics = log_path / "metrics.jsonl"
+    before = len(docqa.read_jsonl(metrics)) if metrics.exists() else 0
+    last = checkpoint_utils.get_last_checkpoint(str(log_path))
+    end = max_steps or len(docqa.read_jsonl(docqa.OUT / "train.jsonl")) // groups_per_batch
+    steps = end - (last.batch if last else 0)
+    _guard(steps * step_usd, _remaining(budget))
+    lr = lr or train.learning_rate()
+    typer.echo(f"learning rate {lr:.3g}; steps {end - steps}..{end} -> {log_path}", err=True)
+    train.run(train.config(str(log_path), lr, groups_per_batch, group_size, max_steps))
+
+    usd = sum(docqa.rl_cost(r) for r in docqa.read_jsonl(metrics)[before:])
+    total = docqa.log_spend(f"train docqa {run}", usd, lr=lr, groups_per_batch=groups_per_batch,
+                            group_size=group_size, steps=f"{end - steps}..{end}")
+    typer.echo(f"${usd:.2f} this run (total ${total:.2f}); checkpoints: {log_path / 'checkpoints.jsonl'}")
 
 
 @score_app.command("verifier")

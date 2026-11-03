@@ -59,7 +59,7 @@ def test_bundle_has_six_pages_two_targets_and_is_deterministic(tmp_path):
     texts = page_texts(pdf)
     assert len(texts) == 6 and len(set(texts)) == 6
     assert {"doc0_p1", "doc1_p1"} <= set(texts)
-    assert [o["source"] for o in order] == [t + ".pdf" for t in texts]
+    assert [o["source"] for o in order] == [f"pages/{t}.pdf" for t in texts]
     assert [o["target"] for o in order].count(True) == 2
     assert [o["page"] for o in order] == [1, 2, 3, 4, 5, 6]
     assert docqa.make_bundle(targets, pool, seed="docqa-0-0001") == (pdf, order)
@@ -145,7 +145,7 @@ def test_env_reward_is_mean_p_pass_over_scored_criteria(monkeypatch):
     assert result.metrics["rubric_score"] == pytest.approx(0.75)
     assert result.metrics["completion_tokens"] == len("The answer is 42.") and result.metrics["truncated"] == 0
     req, cfg = seen[0]
-    assert req.response == "The answer is 42." and [c.text for c in req.criteria][0] == "The response should a."
+    assert req.response == "The answer is 42." and req.criteria[0].text == "The response should a."
     assert cfg.base_model == "Qwen/Qwen3.8-27B"
 
 
