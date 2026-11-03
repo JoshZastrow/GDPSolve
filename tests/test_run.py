@@ -743,6 +743,12 @@ def test_merge_falls_back_to_the_root_report(tmp_path):
     assert result.status == "ok" and result.answer == "root answer" and result.confidence == 0.0
 
 
+def test_merge_writes_an_answer_from_fields_when_the_report_has_none(tmp_path):
+    doc, req = fake_doc(3), make_run(tmp_path).req
+    result = run.merge(doc, req, {"root": ready("root", None, [field("rate", 0.9), field("count", 0.7)])}, "root", "root")
+    assert result.status == "ok" and result.answer == f"rate: {field('rate', 0).value}\ncount: {field('count', 0).value}"
+
+
 def test_merge_joins_ready_answers_as_partial(tmp_path):
     from gdpsolve.schemas import Report
 
