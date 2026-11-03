@@ -410,28 +410,171 @@ class Policy(Protocol):
     def step(self, messages: list) -> Turn: ...
 
 
+TOOLS = ["inspect_pdf", "read_native_text", "render", "crop", "recognize", "split", "post", "report"]  # v0 TOOLBOX subset
+
+
+def tool_specs() -> list[dict]:
+    """The v0 tool specs: each TOOLBOX model's docstring and JSON Schema."""
+    from gdpsolve.schemas import TOOLBOX
+
+    return [{"name": name, "description": TOOLBOX[name].__doc__.strip(), "parameters": TOOLBOX[name].model_json_schema()}
+            for name in TOOLS]
+
+
 class TinkerPolicy:
-    """MODEL with the tml_v0 renderer; the tool specs are the TOOLBOX JSON Schemas."""
+    """MODEL with the tml_v0 renderer; the tool specs are the TOOLBOX JSON Schemas.
+
+    `step` takes the cookbook Message dicts that run_job makes (see the worker section). It uses the first tool
+    call of the completion. A completion without a tool call becomes a failed `report` with its text as the answer.
+    The renderer and the sampling client are made at the first step; the client is shared by the worker threads.
+    """
 
     def __init__(self, model: str = MODEL):
         self.model = model
+        self.renderer = None
+        self.client = None
+        self._lock = threading.Lock()
+
+    def _setup(self) -> None:
+        import tinker
+        from tinker_cookbook import renderers
+        from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+        with self._lock:
+            if self.renderer is None:
+                self.renderer = renderers.get_renderer("tml_v0", get_tokenizer(self.model))
+            if self.client is None:
+                self.client = tinker.ServiceClient().create_sampling_client(base_model=self.model)
 
     def step(self, messages: list) -> Turn:
         """Sample one turn (EFFORT, MAX_TOKENS) and parse its tool call."""
-        raise NotImplementedError
+        import json
+
+        import tinker
+        from tinker_cookbook import renderers
+
+        if self.renderer is None or self.client is None:
+            self._setup()
+        prefix = self.renderer.create_conversation_prefix_with_tools(tool_specs())
+        prompt = self.renderer.build_generation_prompt(prefix + messages, effort=EFFORT)
+        params = tinker.SamplingParams(max_tokens=MAX_TOKENS, stop=self.renderer.get_stop_sequences())
+        tokens = self.client.sample(prompt, num_samples=1, sampling_params=params).result().sequences[0].tokens
+        message, _ = self.renderer.parse_response(tokens)
+        if calls := message.get("tool_calls"):
+            tool, args = calls[0].function.name, json.loads(calls[0].function.arguments)
+        else:
+            tool = "report"
+            args = {"state": "failed", "summary": "no tool call", "answer": renderers.get_text_content(message)}
+        return Turn(tool, args, prompt.length, len(tokens))
 
 
 # --- worker ---
 
 
+# Policy messages are tinker_cookbook Message dicts:
+#   {"role": "user", "content": [text parts]}                     first message, and the forced-report prompt
+#   {"role": "assistant", "content": "", "tool_calls": [{"id", "type": "function", "function": {"name", "arguments"}}]}
+#   {"role": "tool", "tool_call_id", "name", "content": [text/image parts]}   tool result, Thread news, budget left
+# Image parts are {"type": "image", "image": PIL.Image or data URL}, as run_tool returns them.
+
+
+def _thread_text(msgs: list[Message]) -> str:
+    return "\n".join(f"[{m.seq}] {m.kind} from job {m.job_id}" + (f" pages {m.pages}" if m.pages else "")
+                     + (f": {m.note}" if m.note else "") for m in msgs)
+
+
+def _news(run: Run, job: Job, seen: int) -> tuple[list[Message], int]:
+    """Thread messages after index `seen` from other jobs, and the new `seen`."""
+    with run.lock:
+        new = run.thread[seen:]
+    return [m for m in new if m.job_id != job.id], seen + len(new)
+
+
+def _budget(run: Run, job: Job, steps: int) -> str:
+    return (f"Budget left: {job.max_steps - steps} steps, {max(0, int(run.deadline - 30 - time.time()))} s, "
+            f"${max(0.0, MAX_COST_PER_DOC - run.cost):.3f}.")
+
+
+def _limit(run: Run, job: Job, steps: int) -> str:
+    if steps >= job.max_steps:
+        return f"You used all {job.max_steps} steps."
+    if time.time() >= run.deadline - 30:
+        return "The deadline is in less than 30 s."
+    if run.cost > MAX_COST_PER_DOC:
+        return f"The request cost is more than ${MAX_COST_PER_DOC}."
+    return ""
+
+
+def _report(run: Run, job: Job, args: dict) -> str:
+    # The report tool, done here and not in run_tool: it is part of the job loop. It writes the job's latest report.
+    report = Report.model_validate({**args, "job_id": job.id})
+    with run.lock:
+        run.reports[job.id] = report
+    return "reported"
+
+
+def _ended(run: Run, job: Job) -> bool:
+    report = run.reports.get(job.id)
+    return report is not None and report.state in ("ready", "failed")
+
+
 def run_job(run: Run, job: Job) -> None:
     """Ask the policy for turns and run their tools until a ready/failed report or a limit."""
-    raise NotImplementedError
+    import json
+
+    from gdpsolve import trace
+
+    pages = job.pages or list(range(1, job.document.metadata.page_count + 1))
+    news, seen = _news(run, job, 0)
+    first = (f"Instructions: {job.instructions}\n\nDocument: {job.document.metadata.filename}, "
+             f"{job.document.metadata.page_count} pages. Your job ({job.kind}) covers pages {pages}.\n"
+             f"{_budget(run, job, 0)}\nUse the tools to read the pages. End with `report` (state ready or failed).")
+    if news:
+        first += f"\n\nThread so far:\n{_thread_text(news)}"
+    messages: list[dict] = [{"role": "user", "content": [{"type": "text", "text": first}]}]
+    steps = 0
+    while True:
+        limit = _limit(run, job, steps)
+        if limit:
+            messages.append({"role": "user", "content": [{"type": "text", "text":
+                             f"{limit} Call `report` now with state ready or failed and your best answer."}]})
+        try:
+            turn = run.policy.step(messages)
+        except Exception as e:  # noqa: BLE001 -- a sampling error ends this job, not the worker thread
+            _report(run, job, {"state": "failed", "summary": "policy error", "error": f"{type(e).__name__}: {e}"})
+            return
+        run.charge(turn)
+        trace.call("step", job_id=job.id, tool=turn.tool, prompt_tokens=turn.prompt_tokens,
+                   completion_tokens=turn.completion_tokens)
+        steps += 1
+        try:
+            if turn.tool == "report":
+                parts = [{"type": "text", "text": _report(run, job, turn.args)}]
+            else:
+                parts = run_tool(run, job, turn.tool, turn.args)
+        except Exception as e:  # noqa: BLE001 -- the model sees the error and can try again
+            parts = [{"type": "text", "text": f"Error: {type(e).__name__}: {e}"}]
+        if (turn.tool == "report" and _ended(run, job)) or limit:
+            break
+        news, seen = _news(run, job, seen)
+        if news:
+            parts.append({"type": "text", "text": f"New Thread messages:\n{_thread_text(news)}"})
+        parts.append({"type": "text", "text": _budget(run, job, steps)})
+        call_id = f"call_{steps}"
+        messages.append({"role": "assistant", "content": "", "tool_calls": [
+            {"id": call_id, "type": "function", "function": {"name": turn.tool, "arguments": json.dumps(turn.args)}}]})
+        messages.append({"role": "tool", "tool_call_id": call_id, "name": turn.tool, "content": parts})
+    if not _ended(run, job):
+        _report(run, job, {"state": "failed", "summary": "no ready report before the limit"})
 
 
 def worker(run: Run) -> None:
     """Run jobs from `run.jobs` until a None stop signal."""
-    raise NotImplementedError
+    while True:
+        job = run.jobs.get()
+        if job is None:
+            return
+        run_job(run, job)
 
 
 # --- router ---

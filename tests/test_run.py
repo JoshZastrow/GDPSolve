@@ -5,6 +5,7 @@ Each task adds its tests only in its own `# --- T<n> ---` section.
 
 import hashlib
 import io
+import json
 import os
 import threading
 import time
@@ -157,9 +158,6 @@ def test_config():
 
 
 STUBS = [
-    ("TinkerPolicy", lambda r: run.TinkerPolicy().step([])),
-    ("run_job", lambda r: run.run_job(r, None)),
-    ("worker", lambda r: run.worker(r)),
     ("plan", lambda r: run.plan(None, r.req)),
     ("react", lambda r: run.react(None, r.req, None, r)),
     ("merge", lambda r: run.merge(None, r.req, {})),
@@ -505,10 +503,236 @@ def test_live_paddle_reads_a_word_from_a_rendered_page(tmp_path, monkeypatch):
 # --- T4 ---
 
 
+def make_job(r: run.Run, max_steps: int = 10, pages=None, job_id: str = "j1"):
+    """A Job over a 3-page Document (no real PDF; the T4 tests fake run_tool)."""
+    from datetime import datetime
+
+    from gdpsolve.schemas import Document, DocumentMetadata, Job, ObjectRef
+
+    doc = Document(metadata=DocumentMetadata(filename="a.pdf", sha256="0" * 64, page_count=3, encrypted=False,
+                                             has_text_layer=True),
+                   pdf=ObjectRef(sha256="0" * 64, media_type="application/pdf", size=1))
+    return Job(id=job_id, request_id=r.req.id, document=doc, instructions="Find the total.", pages=pages,
+               max_steps=max_steps, deadline_at=datetime.fromtimestamp(r.deadline))
+
+
+def text_of(message: dict) -> str:
+    content = message["content"]
+    return content if isinstance(content, str) else "".join(p.get("text", "") for p in content)
+
+
+READY = run.Turn("report", {"state": "ready", "summary": "done", "answer": "42"}, 100, 10)
+INSPECT = run.Turn("inspect_pdf", {"page": 1}, 100, 10)
+
+
+@pytest.fixture
+def tool_calls(monkeypatch):
+    """Fake run_tool: records (job id, tool, args) and returns one text part."""
+    calls = []
+
+    def fake(r, job, tool, args):
+        calls.append((job.id, tool, args))
+        return [{"type": "text", "text": f"{tool} result"}]
+
+    monkeypatch.setattr(run, "run_tool", fake)
+    return calls
+
+
+def test_run_job_report_ready_ends_the_job(tmp_path, tool_calls, monkeypatch):
+    steps = []
+    monkeypatch.setattr("gdpsolve.trace.call", lambda kind, **f: steps.append((kind, f)))
+    policy = FakePolicy([INSPECT, READY, INSPECT])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    report = r.reports["j1"]
+    assert report.state == "ready" and report.answer == "42" and report.job_id == "j1"
+    assert len(policy.seen) == 2 and policy.turns == [INSPECT]
+    assert tool_calls == [("j1", "inspect_pdf", {"page": 1})]
+    assert "Find the total." in text_of(policy.seen[0][0])
+    assert "inspect_pdf result" in text_of(policy.seen[1][-1])
+    assert r.cost == pytest.approx(2 * (100 * 0.58 + 10 * 1.44) / 1e6)
+    assert [(k, f["job_id"], f["tool"], f["prompt_tokens"], f["completion_tokens"]) for k, f in steps] == [
+        ("step", "j1", "inspect_pdf", 100, 10), ("step", "j1", "report", 100, 10)]
+
+
+def test_run_job_report_progress_does_not_end_the_job(tmp_path, tool_calls):
+    progress = run.Turn("report", {"state": "progress", "summary": "half"}, 1, 1)
+    policy = FakePolicy([progress, READY])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    assert len(policy.seen) == 2 and r.reports["j1"].state == "ready"
+
+
+def test_run_job_tool_error_becomes_an_observation(tmp_path, monkeypatch):
+    def broken(r, job, tool, args):
+        raise ValueError("page 9 is out of range")
+
+    monkeypatch.setattr(run, "run_tool", broken)
+    policy = FakePolicy([INSPECT, READY])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    assert "page 9 is out of range" in text_of(policy.seen[1][-1])
+    assert r.reports["j1"].state == "ready"
+
+
+def test_run_job_bad_report_args_become_an_observation(tmp_path, tool_calls):
+    bad = run.Turn("report", {"state": "done"}, 1, 1)
+    policy = FakePolicy([bad, READY])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    assert "state" in text_of(policy.seen[1][-1]) and r.reports["j1"].state == "ready"
+
+
+@pytest.mark.parametrize("limit", ["steps", "deadline", "cost"])
+def test_run_job_limit_forces_one_report_turn(tmp_path, tool_calls, limit):
+    forced_at = 2 if limit == "steps" else 0
+    policy = FakePolicy([INSPECT] * forced_at + [READY])
+    r = make_run(tmp_path, policy=policy, deadline_s=20 if limit == "deadline" else 300)
+    if limit == "cost":
+        r.cost = run.MAX_COST_PER_DOC + 0.01
+    run.run_job(r, make_job(r, max_steps=2))
+    assert len(policy.seen) == forced_at + 1
+    assert "report" in text_of(policy.seen[forced_at][-1]).lower()
+    assert r.reports["j1"].state == "ready"
+
+
+def test_run_job_writes_failed_report_when_the_forced_turn_does_not_report(tmp_path, tool_calls):
+    policy = FakePolicy([INSPECT, INSPECT])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r, max_steps=1))
+    assert len(policy.seen) == 2 and r.reports["j1"].state == "failed"
+
+
+def test_run_job_shows_other_jobs_messages_but_not_its_own(tmp_path, monkeypatch):
+    def posting(r, job, tool, args):
+        r.post(Message(thread=r.req.id, job_id="other", kind="note", note="table continues on p. 3"))
+        r.post(Message(thread=r.req.id, job_id=job.id, kind="note", note="my own note"))
+        return [{"type": "text", "text": "posted"}]
+
+    monkeypatch.setattr(run, "run_tool", posting)
+    policy = FakePolicy([INSPECT, INSPECT, READY])
+    r = make_run(tmp_path, policy=policy)
+    r.post(Message(thread=r.req.id, job_id="earlier", kind="unrelated", pages=[2], note="cover page"))
+    run.run_job(r, make_job(r))
+    assert "cover page" in text_of(policy.seen[0][0])
+    first, second = text_of(policy.seen[1][-1]), text_of(policy.seen[2][-1])
+    assert "table continues on p. 3" in first and "my own note" not in first and "cover page" not in first
+    assert second.count("table continues on p. 3") == 1  # only the message from the second call
+
+
+def test_worker_runs_jobs_until_none(tmp_path, monkeypatch):
+    ran = []
+    monkeypatch.setattr(run, "run_job", lambda r, job: ran.append(job.id))
+    r = make_run(tmp_path)
+    for job_id in ["a", "b"]:
+        r.jobs.put(make_job(r, job_id=job_id))
+    r.jobs.put(None)
+    t = threading.Thread(target=run.worker, args=(r,), daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive() and ran == ["a", "b"]
+
+
 # --- T5 ---
 
 
 # --- T6 ---
+
+V0_TOOLS = ["inspect_pdf", "read_native_text", "render", "crop", "recognize", "split", "post", "report"]
+
+
+def test_tool_specs_come_from_toolbox():
+    from gdpsolve.schemas import TOOLBOX
+
+    specs = run.tool_specs()
+    assert [s["name"] for s in specs] == V0_TOOLS
+    for s in specs:
+        assert s["parameters"] == TOOLBOX[s["name"]].model_json_schema() and s["description"]
+
+
+@pytest.fixture
+def tml_renderer():
+    """The real tml_v0 renderer for MODEL; skips when the tokenizer cannot be loaded (offline, no cache)."""
+    try:
+        from tinker_cookbook import renderers
+        from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+        return renderers.get_renderer("tml_v0", get_tokenizer(run.MODEL))
+    except Exception as e:  # noqa: BLE001
+        pytest.skip(f"tml_v0 tokenizer unavailable: {e}")
+
+
+class FakeClient:
+    """A Tinker sampling client that returns fixed tokens. Records each (prompt, sampling_params)."""
+
+    def __init__(self, tokens: list[int]):
+        self.tokens = tokens
+        self.calls = []
+
+    def sample(self, prompt, num_samples, sampling_params):
+        from concurrent.futures import Future
+        from types import SimpleNamespace
+
+        self.calls.append((prompt, sampling_params))
+        future = Future()
+        future.set_result(SimpleNamespace(sequences=[SimpleNamespace(tokens=self.tokens)]))
+        return future
+
+
+def completion_tokens(renderer, assistant: dict) -> list[int]:
+    """The tokens the model would sample for `assistant`: the trained part of an SFT example."""
+    model_input, weights = renderer.build_supervised_example([{"role": "user", "content": "hi"}, assistant])
+    tokens = [t for chunk in model_input.chunks for t in chunk.tokens]
+    return [t for t, w in zip(tokens, weights.tolist(), strict=True) if w > 0]
+
+
+def policy_with(renderer, tokens: list[int]) -> run.TinkerPolicy:
+    policy = run.TinkerPolicy()
+    policy.renderer, policy.client = renderer, FakeClient(tokens)
+    return policy
+
+
+def test_tinker_policy_parses_a_tool_call_into_a_turn(tml_renderer):
+    from gdpsolve import trace
+
+    args = {"page": 2, "bbox": {"page": 2, "x0": 0, "y0": 0, "x1": 100, "y1": 50}, "dpi": 300}
+    call = {"id": "c1", "type": "function", "function": {"name": "crop", "arguments": json.dumps(args)}}
+    tokens = completion_tokens(tml_renderer, {"role": "assistant", "content": "", "tool_calls": [call]})
+    policy = policy_with(tml_renderer, tokens)
+    turn = policy.step([{"role": "user", "content": [{"type": "text", "text": "Crop the table."}]}])
+    prompt, params = policy.client.calls[0]
+    assert turn == run.Turn("crop", args, prompt.length, len(tokens))
+    assert params.max_tokens == run.MAX_TOKENS == 4096
+    text = trace.prompt_text(tml_renderer.tokenizer, prompt)
+    assert "Thinking effort level: 0.3" in text and "Crop the table." in text
+    assert all(f'"name":"{name}"' in text for name in V0_TOOLS) and "detect_layout" not in text
+
+
+def test_tinker_policy_without_a_tool_call_gives_a_failed_report(tml_renderer):
+    tokens = completion_tokens(tml_renderer, {"role": "assistant", "content": "The total is 42."})
+    turn = policy_with(tml_renderer, tokens).step([{"role": "user", "content": "q"}])
+    assert turn.tool == "report" and turn.args["state"] == "failed" and turn.args["answer"] == "The total is 42."
+
+
+def test_tinker_policy_step_cost(tmp_path, tml_renderer, monkeypatch):
+    tokens = completion_tokens(tml_renderer, {"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "type": "function", "function": {"name": "report",
+                                                      "arguments": json.dumps({"state": "ready", "summary": "s"})}}]})
+    policy = policy_with(tml_renderer, tokens)
+    monkeypatch.setattr(run, "run_tool", lambda *a: [])
+    r = make_run(tmp_path, policy=policy)
+    run.run_job(r, make_job(r))
+    prompt, _ = policy.client.calls[0]
+    assert r.reports["j1"].state == "ready"
+    assert r.cost == pytest.approx((prompt.length * 0.58 + len(tokens) * 1.44) / 1e6)
+
+
+@pytest.mark.skipif(not os.environ.get("RUN_LIVE"), reason="live Tinker call; set RUN_LIVE=1")
+def test_tinker_policy_live():
+    turn = run.TinkerPolicy().step([{"role": "user", "content": [{"type": "text", "text":
+                                     "The document has 1 page. Inspect page 1 with the inspect_pdf tool."}]}])
+    print(turn, f"cost ${(turn.prompt_tokens * 0.58 + turn.completion_tokens * 1.44) / 1e6:.5f}")
+    assert turn.tool in V0_TOOLS and turn.prompt_tokens > 0 and turn.completion_tokens > 0
 
 
 # --- T7 ---
