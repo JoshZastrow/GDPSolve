@@ -650,6 +650,8 @@ def merge(doc: Document, req: ExtractionRequest, reports: dict[str, Report], fin
     if final_id in by_id or root_id in by_id:
         best = by_id.get(final_id) or by_id[root_id]
         status, answer, fields = "ok", best.answer, best.fields
+        if not answer and fields:  # GDP.pdf grades only the answer, so state the fields in it
+            answer = "\n".join(f"{f.name}: {f.value}" for f in fields)
     elif ready:
         status = "partial"
         answer = "\n\n".join(r.answer for r in ready if r.answer)
