@@ -4,6 +4,7 @@ Each task adds its tests only in its own `# --- T<n> ---` section.
 """
 
 import io
+import os
 import threading
 import time
 
@@ -155,9 +156,6 @@ def test_config():
 
 STUBS = [
     ("ingest", lambda r: run.ingest(r.req)),
-    ("recognize", lambda r: run.recognize(r, None)),
-    ("ensure_ocr_server", lambda r: run.ensure_ocr_server()),
-    ("PaddleRecognizer", lambda r: run.PaddleRecognizer()(None, "text")),
     ("TinkerPolicy", lambda r: run.TinkerPolicy().step([])),
     ("run_job", lambda r: run.run_job(r, None)),
     ("worker", lambda r: run.worker(r)),
@@ -291,6 +289,166 @@ def test_run_tool_split_and_post_go_to_the_thread(tmp_path, monkeypatch):
 
 
 # --- T3 ---
+
+
+class FakeOcrServer:
+    """A llama-server stand-in on a free port: GET /health and POST /v1/chat/completions."""
+
+    def __init__(self, health: int = 200, content: str = "warm", port: int = 0):
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.health, self.content, self.bodies = health, content, []
+        fake = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def reply(self, code: int, body: dict):
+                data = json.dumps(body).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self.reply(fake.health, {"status": "ok" if fake.health == 200 else "loading"})
+
+            def do_POST(self):
+                fake.bodies.append(json.loads(self.rfile.read(int(self.headers["Content-Length"]))))
+                self.reply(200, {"choices": [{"message": {"role": "assistant", "content": fake.content}}]})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.url = f"http://127.0.0.1:{self.server.server_port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def ocr_server():
+    server = FakeOcrServer()
+    yield server
+    server.close()
+
+
+def free_url() -> str:
+    """A URL where nothing listens."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return f"http://127.0.0.1:{s.getsockname()[1]}"
+
+
+def image_of(text: str):
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (200, 60), "white")
+    ImageDraw.Draw(image).text((10, 10), text, fill="black", font_size=32)
+    return image
+
+
+@pytest.mark.parametrize("mode,prompt", list(run.OCR_PROMPTS.items()))
+def test_each_mode_gives_its_prompt(ocr_server, mode, prompt):
+    run.PaddleRecognizer(ocr_server.url)(image_of("x"), mode)
+    assert ocr_server.bodies[0]["messages"][0]["content"][-1] == {"type": "text", "text": prompt}
+
+
+def test_request_body_has_image_url_prompt_and_temperature_0(ocr_server):
+    import base64
+
+    from PIL import Image
+
+    out = run.PaddleRecognizer(ocr_server.url)(image_of("x"), "text")
+    assert out == "warm"
+    (body,) = ocr_server.bodies
+    assert body["model"] == "paddleocr-vl" and body["temperature"] == 0 and body["max_tokens"] == 2048
+    (msg,) = body["messages"]
+    image_part, text_part = msg["content"]
+    assert msg["role"] == "user" and text_part == {"type": "text", "text": "OCR:"}
+    url = image_part["image_url"]["url"]
+    assert image_part["type"] == "image_url" and url.startswith("data:image/png;base64,")
+    assert Image.open(io.BytesIO(base64.b64decode(url.split(",", 1)[1]))).size == (200, 60)
+
+
+def test_table_output_becomes_markdown(ocr_server):
+    ocr_server.content = "<fcel>Item<fcel>Q1<fcel>Q2<nl><fcel>Freight<fcel>1,100<ecel><nl>"
+    assert run.PaddleRecognizer(ocr_server.url)(image_of("x"), "table") == (
+        "| Item | Q1 | Q2 |\n| --- | --- | --- |\n| Freight | 1,100 |  |")
+
+
+def test_otsl_to_markdown():
+    assert run.otsl_to_markdown("<fcel>A<fcel>B<nl><fcel>1<nl>") == "| A | B |\n| --- | --- |\n| 1 |  |"
+    assert run.otsl_to_markdown("<fcel>a|b<lcel><nl>") == "| a\\|b |  |\n| --- | --- |"
+    assert run.otsl_to_markdown("plain text") == "plain text"
+
+
+def test_ensure_ocr_server_returns_at_once_when_health_is_200(ocr_server, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: pytest.fail("must not start a server"))
+    seconds = run.ensure_ocr_server(ocr_server.url, timeout_s=5)
+    assert seconds >= 0 and len(ocr_server.bodies) == 1  # one warm-up request
+    assert ocr_server.bodies[0]["messages"][0]["content"][-1]["text"] == "OCR:"
+    assert run.ensure_ocr_server(ocr_server.url) == 0.0 and len(ocr_server.bodies) == 1  # a second call does nothing
+
+
+def test_ensure_ocr_server_starts_the_server_when_it_is_down(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    url = free_url()
+    port = int(url.rsplit(":", 1)[1])
+    started = []
+
+    def fake_popen(cmd, **kwargs):  # the "server" comes up on the port in the command
+        started.append((cmd, FakeOcrServer(port=port)))
+        return object()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    try:
+        assert run.ensure_ocr_server(url, timeout_s=10) >= 0
+    finally:
+        for _, server in started:
+            server.close()
+    (cmd, server), = started
+    assert cmd[1:] == ["serve", "-hf", "PaddlePaddle/PaddleOCR-VL-1.6-GGUF", "--temp", "0",
+                       "--port", str(port), "-np", "4", "--alias", "paddleocr-vl"]
+    assert (tmp_path / "var/log/llama-serve.log").exists() and len(server.bodies) == 1
+
+
+def test_ensure_ocr_server_raises_after_the_timeout(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: object())
+    with pytest.raises(RuntimeError, match="llama-serve.log"):
+        run.ensure_ocr_server(free_url(), timeout_s=0)
+
+
+def test_recognize_runs_the_recognizer_on_a_region(tmp_path, monkeypatch):
+    rec = FakeRecognizer()
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]), recognizer=rec)
+    region = run.render(r, run.Render(page=1, dpi=72))
+    assert run.recognize(r, run.Recognize(region=region.id, mode="table")) == "table:text"
+    assert run.run_tool(r, None, "recognize", {"region": region.id, "mode": "table"}) == [
+        {"type": "text", "text": "table:text"}]
+    (image, mode), = rec.calls  # the second call came from the memo
+    assert mode == "table" and image.size == (612, 792)
+    assert "unknown region" in run.recognize(r, run.Recognize(region="nope", mode="text"))
+
+
+@pytest.mark.skipif(os.environ.get("RUN_LIVE") != "1", reason="needs RUN_LIVE=1 and the local OCR server")
+def test_live_paddle_reads_a_word_from_a_rendered_page(tmp_path, monkeypatch):
+    print(f"ocr_warmup_s={run.ensure_ocr_server():.2f}")
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Invoice"]), recognizer=run.PaddleRecognizer())
+    region = run.render(r, run.Render(page=1, dpi=150))
+    assert "Invoice" in run.recognize(r, run.Recognize(region=region.id, mode="text"))
 
 
 # --- T4 ---
