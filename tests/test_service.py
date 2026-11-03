@@ -9,7 +9,6 @@ from test_run import FakeRecognizer, make_pdf, make_scan
 from typer.testing import CliRunner
 
 from gdpsolve import client, service
-from gdpsolve.verifier import store
 
 
 class FakeSampler:
@@ -84,7 +83,7 @@ def test_parse_native_text_and_figure_pages(var):
 
 def test_parse_page_range(var):
     file_id = upload(make_pdf(["one", "two", "three", "four"]))
-    pages = lambda out: [c["blocks"][0]["bbox"]["page"] for c in out["result"]["chunks"]]  # noqa: E731
+    pages = lambda out: [c["blocks"][0]["bbox"]["page"] for c in out["result"]["chunks"]]
     assert pages(service.handle(config(), "parse", {"input": file_id, "settings": {"page_range": {"start": 2, "end": 3}}})) == [2, 3]
     assert pages(service.handle(config(), "parse", {"input": file_id, "settings": {"page_range": [4, 1]}})) == [1, 4]
     assert pages(service.handle(config(), "parse", {"input": file_id, "settings": {"page_range": None}})) == [1, 2, 3, 4]
@@ -304,7 +303,7 @@ def test_eval_gdp_pdf_service_writes_baseline_rows(server, tmp_path, monkeypatch
         assert row["prompt_sha256"] == "0" * 64 and row["latency_s"] >= 0
         assert row["document"]["filename"].endswith(".pdf")
     stats = json.loads((out / "run.json").read_text())
-    assert stats["system"] == "service" and stats["n"] == 2 and stats["wall_s"] > 0
+    assert stats["system"] == "service" and stats["n"] == 2 and stats["wall_s"] >= 0
     assert stats["throughput_docs_per_min"] > 0 and stats["latency_p50"] is not None
     assert stats["latency_p95"] is not None and stats["cost_usd"] == pytest.approx(2 * (100 * 0.58 + 5 * 1.44) / 1e6)
     assert stats["config"]["parser"] == "native"

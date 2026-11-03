@@ -170,10 +170,10 @@ def _eval_verifier_gdp_pdf(checker: str, cfg, run: Path, budget: float) -> None:
 @eval_app.command("gdp-pdf")
 def eval_gdp_pdf(
     system: Annotated[str, typer.Option(help="baseline (one sample per task) | process (process(): router + "
-                                             "workers).")] = "baseline",
+                                             "workers) | service (extract through the service SDK).")] = "baseline",
     model: Annotated[str, typer.Option(help="baseline: Tinker base model.")] = "thinkingmachines/Inkling-Small",
-    out: Annotated[Path | None, typer.Option(help="Run directory for results.jsonl; default var/runs/m1 (baseline) "
-                                                  "or var/runs/m2 (process).")] = None,
+    out: Annotated[Path | None, typer.Option(help="Run directory for results.jsonl; default var/runs/m1 (baseline), "
+                                                  "var/runs/m2 (process), or var/runs/service.")] = None,
     data: Annotated[Path, typer.Option(help="GDP.pdf directory.")] = gdp_pdf.DEFAULT_DIR,
     limit: Annotated[int | None, typer.Option(help="Only the first N tasks.")] = None,
     max_tokens: Annotated[int, typer.Option(help="Completion token cap.")] = 4096,
@@ -182,6 +182,7 @@ def eval_gdp_pdf(
     effort: Annotated[float, typer.Option(help="Reasoning effort for the tml_v0 renderer, in [0, 1).")] = 0.9,
     rerun_truncated: Annotated[bool, typer.Option(help="Also re-answer rows whose answer hit max tokens.")] = False,
     workers: Annotated[int, typer.Option(help="process: worker threads for each document.")] = 4,
+    url: Annotated[str, typer.Option(help="service: URL of `gdpsolve serve`.")] = "http://127.0.0.1:8787",
     budget: Budget = 5.0,
 ) -> None:
     """Answers on GDP.pdf (evaluation only); resumes from results.jsonl.
@@ -193,9 +194,11 @@ def eval_gdp_pdf(
 
     from gdpsolve.eval import baseline
 
-    if system not in ("baseline", "process"):
-        raise typer.BadParameter("--system must be baseline or process")
+    if system not in ("baseline", "process", "service"):
+        raise typer.BadParameter("--system must be baseline, process, or service")
     tasks = gdp_pdf.load_tasks(data)[:limit]
+    if system == "service":
+        return _eval_gdp_pdf_service(tasks, out or Path("var/runs/service"), data, url, concurrency)
     if system == "process":
         return _eval_gdp_pdf_process(tasks, out or Path("var/runs/m2"), data, workers, budget)
     out = out or Path("var/runs/m1")
@@ -253,6 +256,98 @@ def _eval_gdp_pdf_process(tasks: list[dict], out: Path, data: Path, workers: int
                   "latency_p95": pct(0.95)}
         logger.log_metrics(counts)
     typer.echo(f"{results}: {json.dumps(counts)}")
+
+
+def _eval_gdp_pdf_service(tasks: list[dict], out: Path, data: Path, url: str, concurrency: int) -> None:
+    """Each task without an ok row through the service SDK (upload, then extract), `concurrency` at a time.
+
+    Rows have the baseline format; latency_s is the client wall time for the document. Writes run.json.
+    """
+    import json
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from gdpsolve.client import GDPSolve
+    from gdpsolve.eval import baseline, pdf_input
+    from gdpsolve.schemas import ExtractionResult
+
+    out.mkdir(parents=True, exist_ok=True)
+    results = out / "results.jsonl"
+    todo = baseline.pending(tasks, results)
+    sdk = GDPSolve(url)
+    config = sdk.health()["config"]
+    typer.echo(f"{len(todo)} tasks to answer ({len(tasks) - len(todo)} done) via {url}: {json.dumps(config)}",
+               err=True)
+    meta = {t["task_id"]: pdf_input.metadata(data / t["pdf_path"]) for t in todo}  # pdfium is not thread-safe
+    lock = threading.Lock()
+    new: list[tuple[dict, float]] = []
+
+    def one(task: dict) -> None:
+        start = time.monotonic()
+        run = {"model": config["model"], "effort": config["effort"], "truncated_at_page": None}
+        cost = 0.0
+        try:
+            file_id = sdk.upload(data / task["pdf_path"])["file_id"]
+            r = sdk.extract.run(input=file_id, instructions={"schema": {}, "system_prompt": task["prompt"]})
+            result = ExtractionResult(request_id=task["task_id"], document=meta[task["task_id"]], status="ok",
+                                      answer=r["result"][0]["answer"])
+            run |= {"truncated_at_page": r["truncated_at_page"], "prompt_tokens": r["usage"]["prompt_tokens"],
+                    "completion_tokens": r["usage"]["completion_tokens"], "finish": r["finish"],
+                    "prompt_sha256": r["prompt_sha256"]}
+            cost = r["usage"]["cost_usd"]
+        except Exception as e:  # noqa: BLE001 -- recorded as a failed row; resume retries it
+            result = ExtractionResult(request_id=task["task_id"], document=meta[task["task_id"]], status="failed",
+                                      error=f"{type(e).__name__}: {e}")
+        result.latency_s = round(time.monotonic() - start, 2)
+        row = result.model_dump(mode="json") | run
+        with lock:
+            with results.open("a") as f:
+                f.write(json.dumps(row) + "\n")
+            new.append((row, cost))
+        typer.echo(f"{result.request_id} {result.status} {result.latency_s}s", err=True)
+
+    start = time.monotonic()
+    with ThreadPoolExecutor(concurrency) as pool:
+        list(pool.map(one, todo))
+    wall = time.monotonic() - start
+    latencies = sorted(row["latency_s"] for row, _ in new)
+
+    def pct(q: float) -> float | None:
+        return latencies[min(len(latencies) - 1, int(q * len(latencies)))] if latencies else None
+
+    stats = {"system": "service", "n": len(new), "wall_s": round(wall, 3),
+             "throughput_docs_per_min": round(len(new) / wall * 60, 2), "latency_p50": pct(0.5),
+             "latency_p95": pct(0.95), "cost_usd": sum(c for _, c in new),
+             "ok": sum(row["status"] == "ok" for row, _ in new), "url": url, "config": config}
+    (out / "run.json").write_text(json.dumps(stats, indent=2) + "\n")
+    typer.echo(f"{results}: {json.dumps(stats)}")
+
+
+@app.command("serve")
+def serve(
+    host: Annotated[str, typer.Option(help="Address to listen on.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="Port to listen on.")] = 8787,
+    workers: Annotated[int, typer.Option(help="Worker threads: jobs that run at the same time.")] = 8,
+    parser: Annotated[str, typer.Option(help="native (text layer; pages without one as images) | paddle "
+                                             "(pages without a text layer through PaddleOCR-VL).")] = "native",
+    model: Annotated[str, typer.Option(help="Tinker base model.")] = "thinkingmachines/Inkling-Small",
+    checkpoint: Checkpoint = None,
+    effort: Annotated[float, typer.Option(help="Reasoning effort for the tml_v0 renderer, in [0, 1).")] = 0.3,
+    max_tokens: Annotated[int, typer.Option(help="Completion token cap.")] = 8192,
+    token_budget: Annotated[int, typer.Option(help="PDF content token budget.")] = 120_000,
+) -> None:
+    """Run the document service (docs/service-spec.md) until stopped."""
+    from gdpsolve import run, service
+
+    if parser not in ("native", "paddle"):
+        raise typer.BadParameter("--parser must be native or paddle")
+    if parser == "paddle":
+        run.ensure_ocr_server()
+    cfg = service.Config(parser=parser, model=model, checkpoint=checkpoint, effort=effort, max_tokens=max_tokens,
+                         token_budget=token_budget)
+    typer.echo(f"serving on http://{host}:{port} with {workers} workers: {cfg.settings()}", err=True)
+    service.serve(cfg, host, port, workers)
 
 
 @app.command("extract")
