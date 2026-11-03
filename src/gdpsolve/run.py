@@ -7,6 +7,9 @@ Each task changes only its sections. tinker and tinker_cookbook are imported ins
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import os
 import queue
 import threading
@@ -16,7 +19,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
+from gdpsolve.eval import pdf_input
 from gdpsolve.schemas import (
+    BoundingBox,
     Crop,
     Document,
     ExtractionRequest,
@@ -24,11 +29,13 @@ from gdpsolve.schemas import (
     InspectPdf,
     Job,
     Message,
+    Post,
     ReadNativeText,
     Recognize,
     Region,
     Render,
     Report,
+    Split,
 )
 
 if TYPE_CHECKING:
@@ -111,24 +118,97 @@ def ingest(req: ExtractionRequest) -> Document | ExtractionResult:
 # --- tools ---
 
 
+# pdfium is not thread-safe; workers share this lock for every pdfium call.
+_PDFIUM_LOCK = threading.Lock()
+
+
+def _memo(run: Run, tool: str, args, compute: Callable[[], str]) -> str:
+    """`compute()` once for each (doc, tool, canonical args); later calls read `run.memo`."""
+    key = hashlib.sha256(json.dumps([run.doc.metadata.sha256, tool, args.model_dump(mode="json")],
+                                    sort_keys=True).encode()).hexdigest()
+    if key not in run.memo:
+        result = compute()
+        with run.lock:
+            run.memo[key] = result
+    return run.memo[key]
+
+
 def inspect_pdf(run: Run, args: InspectPdf) -> str:
     """Page size, rotation, text layer, and image cover of one page, as text."""
-    raise NotImplementedError
+    def compute() -> str:
+        import pypdfium2.raw as pdfium_c
+
+        with _PDFIUM_LOCK:
+            page = _open(run)[args.page - 1]
+            w, h = page.get_size()
+            has_text = bool(pdf_input.page_text(page))
+            area = 0.0
+            for obj in page.get_objects(filter=[pdfium_c.FPDF_PAGEOBJ_IMAGE]):
+                x0, y0, x1, y1 = obj.get_bounds()
+                area += max(0.0, min(x1, w) - max(x0, 0)) * max(0.0, min(y1, h) - max(y0, 0))
+            rotation = page.get_rotation()
+        return (f"page {args.page}: {w:g} x {h:g} pt, rotation {rotation}, has_text_layer={has_text}, "
+                f"image_cover={min(1.0, area / (w * h)):.2f}")
+    return _memo(run, "inspect_pdf", args, compute)
 
 
 def read_native_text(run: Run, args: ReadNativeText) -> str:
-    """Text layer of one page, or of one box."""
-    raise NotImplementedError
+    """Text layer of one page, or of one box (points from the top left of the page)."""
+    def compute() -> str:
+        with _PDFIUM_LOCK:
+            page = _open(run)[args.page - 1]
+            if args.bbox is None:
+                return pdf_input.page_text(page)
+            h = page.get_height()
+            b = args.bbox
+            return page.get_textpage().get_text_bounded(left=b.x0, bottom=h - b.y1, right=b.x1, top=h - b.y0).strip()
+    return _memo(run, "read_native_text", args, compute)
 
 
 def render(run: Run, args: Render) -> Region:
     """PNG of one page at `dpi`, in the store and in `run.regions`."""
-    raise NotImplementedError
+    return _region(run, "render", args, args.page, None, args.dpi)
 
 
 def crop(run: Run, args: Crop) -> Region:
-    """PNG of one box at `dpi`, in the store and in `run.regions`."""
-    raise NotImplementedError
+    """PNG of one box at `dpi`, in the store and in `run.regions`. The box gets `padding` points on each side."""
+    return _region(run, "crop", args, args.page, args.bbox, args.dpi, args.padding)
+
+
+def _open(run: Run):
+    """The document as a pdfium PdfDocument; call while holding _PDFIUM_LOCK."""
+    import pypdfium2 as pdfium
+
+    from gdpsolve.verifier import store
+
+    return pdfium.PdfDocument(store.get(run.doc.pdf))
+
+
+def _region(run: Run, tool: str, args, page_no: int, bbox: BoundingBox | None, dpi: int, padding: float = 0.0) -> Region:
+    """Render a page, or a box of it (points from the top left), to a PNG Region; memoized."""
+    def compute() -> str:
+        from gdpsolve.verifier import store
+
+        with _PDFIUM_LOCK:
+            page = _open(run)[page_no - 1]
+            w, h = page.get_size()
+            box = None
+            cut = (0, 0, 0, 0)
+            if bbox is not None:
+                box = BoundingBox(page=page_no, x0=max(0.0, bbox.x0 - padding), y0=max(0.0, bbox.y0 - padding),
+                                  x1=min(w, bbox.x1 + padding), y1=min(h, bbox.y1 + padding))
+                cut = (box.x0, h - box.y1, w - box.x1, box.y0)  # left, bottom, right, top
+            image = page.render(scale=dpi / 72, crop=cut).to_pil()
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        ref = store.put(buf.getvalue(), "image/png")
+        sha = run.doc.metadata.sha256
+        rid = hashlib.sha256(json.dumps([sha, page_no, box and box.model_dump(), dpi, []]).encode()).hexdigest()
+        return Region(id=rid, doc_sha256=sha, page=page_no, bbox=box, dpi=dpi, image=ref).model_dump_json()
+    region = Region.model_validate_json(_memo(run, tool, args, compute))
+    with run.lock:
+        run.regions.setdefault(region.id, region)
+    return region
 
 
 def recognize(run: Run, args: Recognize) -> str:
@@ -138,7 +218,35 @@ def recognize(run: Run, args: Recognize) -> str:
 
 def run_tool(run: Run, job: Job, tool: str, args: dict) -> list[dict]:
     """Run one of the 8 tools for `job`; the observation as content parts ({"type": "text"|"image", ...})."""
-    raise NotImplementedError
+    from PIL import Image
+
+    from gdpsolve.verifier import store
+
+    texts = {"inspect_pdf": (InspectPdf, inspect_pdf), "read_native_text": (ReadNativeText, read_native_text),
+             "recognize": (Recognize, recognize)}
+    images = {"render": (Render, render), "crop": (Crop, crop)}
+    if tool in texts:
+        model, fn = texts[tool]
+        return [{"type": "text", "text": fn(run, model.model_validate(args))}]
+    if tool in images:
+        model, fn = images[tool]
+        region = fn(run, model.model_validate(args))
+        image = Image.open(io.BytesIO(store.get(region.image)))
+        return [{"type": "text", "text": f"region {region.id}: page {region.page}, {region.dpi} dpi, "
+                                         f"{image.width}x{image.height} px"},
+                {"type": "image", "image": image}]
+    if tool == "split":
+        a = Split.model_validate(args)
+        run.post(Message(thread=run.req.id, job_id=job.id, kind="split", pages=a.pages or [],
+                         pages_per_job=a.pages_per_job))
+        return [{"type": "text", "text": "split requested"}]
+    if tool == "post":
+        a = Post.model_validate(args)
+        run.post(Message(thread=run.req.id, job_id=job.id, kind=a.kind, pages=a.pages, note=a.note))
+        return [{"type": "text", "text": "posted"}]
+    if tool == "report":
+        raise NotImplementedError("report: hook for the worker task (T4)")
+    raise ValueError(f"unknown tool: {tool}")
 
 
 # --- recognizer ---
