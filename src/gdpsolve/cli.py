@@ -17,6 +17,8 @@ eval_app = typer.Typer(no_args_is_help=True, help="Evaluate a system or verifier
 app.add_typer(eval_app, name="eval")
 score_app = typer.Typer(no_args_is_help=True, help="Score responses.")
 app.add_typer(score_app, name="score")
+train_app = typer.Typer(no_args_is_help=True, help="Train a LoRA on Tinker (never on GDP.pdf).")
+app.add_typer(train_app, name="train")
 
 Checker = Annotated[str, typer.Option(help="rubric | support (schemas.CHECKERS).")]
 Checkpoint = Annotated[str | None, typer.Option(help="tinker:// sampler path; default: untrained base model.")]
@@ -77,6 +79,133 @@ def synth_tasks(
     _guard(n * (400 * 0.58 + 1500 * 1.44) / 1e6, budget)  # Inkling-Small prefill/sample $/1M tokens
     counts = synth.build(asyncio.run(synth.generate_tasks(n, seed)), out, seed)
     typer.echo(f"{counts} -> {out}")
+
+
+def _remaining(budget: float) -> float:
+    """The smaller of `budget` and what is left of the training-side Tinker cap (var/train/spend.jsonl)."""
+    from gdpsolve import docqa
+
+    return min(budget, docqa.CAP_USD - docqa.spent())
+
+
+@synth_app.command("docqa")
+def synth_docqa(
+    n: Annotated[int, typer.Option(help="Page pairs to send to the teacher.")] = 340,
+    pages: Annotated[Path, typer.Option(help="ParseBench single-page PDFs (<dir>/{text,table,chart}/*.pdf).")] = Path(
+        "data/parsebench/docs"),
+    seed: int = 0,
+    budget: Budget = 3.0,
+) -> None:
+    """Doc-QA tasks (docs/training.md): 6-page bundles from ParseBench, teacher-written requests and rubrics."""
+    import asyncio
+
+    from gdpsolve import docqa
+
+    targets, pool = docqa.eligible(pages)
+    pairs = docqa.page_pairs(targets, seed)[:n]
+    renderer, prompts = docqa.teacher_prompts(pairs)
+    prefill = sum(p.length for p in prompts)
+    typer.echo(f"{len(pairs)} pairs ({len(targets)} target pages, {len(pool)} pages): {prefill:,} prompt tokens",
+               err=True)
+    cache = docqa.OUT / "teacher.jsonl"
+    cached = docqa.read_jsonl(cache) if cache.exists() else []
+    if [r["pair"] for r in cached] == [[str(p) for p in pair] for pair in pairs]:
+        typer.echo(f"reusing the teacher answers in {cache} (no Tinker calls)", err=True)
+        counts = docqa.build(pairs, pool, [r["answer"] for r in cached], seed)
+        return typer.echo(f"{counts} -> {docqa.OUT}")
+    _guard(docqa.cost(docqa.TEACHER, prefill=prefill, sample=800 * len(prompts)), _remaining(budget))
+    answers = asyncio.run(docqa.ask_teacher(renderer, prompts))
+    docqa.write_jsonl(cache, [{"pair": [str(p) for p in pair], "answer": a, "tokens": t}
+                              for pair, (a, t) in zip(pairs, answers, strict=True)])
+    sample = sum(t for _, t in answers)
+    usd = docqa.cost(docqa.TEACHER, prefill=prefill, sample=sample)
+    total = docqa.log_spend("synth docqa", usd, model=docqa.TEACHER, prefill_tokens=prefill, sample_tokens=sample,
+                            n=len(pairs))
+    counts = docqa.build(pairs, pool, [a for a, _ in answers], seed)
+    typer.echo(f"{counts} -> {docqa.OUT}; ${usd:.2f} (total ${total:.2f})")
+
+
+@eval_app.command("docqa")
+def eval_docqa(
+    checkpoint: Checkpoint = None,
+    model: Annotated[str, typer.Option(help="Tinker base model (of the checkpoint).")] = "thinkingmachines/Inkling-Small",
+    name: Annotated[str | None, typer.Option(help="Run name: var/train/evals/<name>.")] = None,
+    max_tokens: Annotated[int, typer.Option(help="Completion token cap, as the service.")] = 8192,
+    concurrency: Annotated[int, typer.Option(help="Parallel rollouts.")] = 16,
+    budget: Budget = 1.5,
+) -> None:
+    """The gdpsolve_docqa dev benchmark (var/docqa/dev.jsonl); prints the score (mean rubric score)."""
+    import asyncio
+    import json
+    import re
+
+    import tinker
+    from tinker_cookbook import model_info, renderers
+    from tinker_cookbook.eval.benchmarks import BenchmarkConfig, run_benchmark
+    from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+    from gdpsolve import docqa
+
+    n = len(docqa.read_jsonl(docqa.OUT / "dev.jsonl"))
+    # about 5k prompt and 3k sampled tokens a task, and 8 grader calls of 1k tokens
+    _guard(n * (docqa.cost(model, prefill=5000, sample=3000) + docqa.cost(docqa.GRADER, prefill=8000)),
+           _remaining(budget))
+    name = name or re.sub(r"[^\w.-]+", "_", checkpoint or model)
+    renderer = renderers.get_renderer(model_info.get_recommended_renderer_name(model), get_tokenizer(model))
+    service = tinker.ServiceClient()
+    client = (service.create_sampling_client(model_path=checkpoint) if checkpoint
+              else service.create_sampling_client(base_model=model))
+    # temperature 1: the service samples with Tinker's default temperature
+    # no save_dir: saving a trajectory decodes its prompt, which fails on image pages and zeroes the example
+    cfg = BenchmarkConfig(max_tokens=max_tokens, temperature=1.0, concurrency=concurrency,
+                          timeout_seconds=docqa.DocQABenchmark.recommended_timeout)
+    result = asyncio.run(run_benchmark(docqa.DocQABenchmark.name, client, renderer, cfg))
+    m = result.metrics
+    out = Path("var/train/evals") / name
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "result.json").write_text(json.dumps({"checkpoint": checkpoint, "model": model, "score": result.score,
+                                                 "num_errors": result.num_errors, "metrics": m}, indent=2))
+    usd = (docqa.cost(model, prefill=m["total_ob_tokens"], sample=m["total_ac_tokens"])
+           + docqa.cost(docqa.GRADER, prefill=m["grader_tokens_total"]))
+    total = docqa.log_spend(f"eval docqa {name}", usd, model=model, checkpoint=checkpoint, score=result.score)
+    typer.echo(json.dumps({"name": name, "score": result.score, "rubric_score": m["rubric_score"],
+                           "n": result.num_examples, "errors": result.num_errors, "truncated": m["truncated"],
+                           "completion_tokens": m["completion_tokens"], "usd": round(usd, 4),
+                           "total_usd": round(total, 4)}), err=True)
+    typer.echo(f"{result.score:.4f}")
+
+
+@train_app.command("docqa")
+def train_docqa(
+    run: Annotated[str, typer.Option(help="Run name: var/train/rl/<run>; the same name resumes.")] = "docqa",
+    max_steps: Annotated[int | None, typer.Option(help="Stop at this step (counted from the start of the run).")] = None,
+    groups_per_batch: Annotated[int, typer.Option(help="Tasks per step.")] = 12,
+    group_size: Annotated[int, typer.Option(help="Rollouts per task (advantages centered per task).")] = 4,
+    lr: Annotated[float | None, typer.Option(help="Learning rate; default train.learning_rate().")] = None,
+    every: Annotated[int, typer.Option(help="Dev eval and checkpoint every N steps.")] = 2,
+    step_usd: Annotated[float, typer.Option(help="Expected cost of one step, for the budget check.")] = 1.2,
+    budget: Budget = 10.0,
+) -> None:
+    """Async RL of Inkling-Small on var/docqa/train.jsonl, dev benchmark every --every steps (docs/training.md)."""
+    from tinker_cookbook import checkpoint_utils
+
+    from gdpsolve import docqa, train
+
+    log_path = Path("var/train/rl") / run
+    metrics = log_path / "metrics.jsonl"
+    before = len(docqa.read_jsonl(metrics)) if metrics.exists() else 0
+    last = checkpoint_utils.get_last_checkpoint(str(log_path))
+    end = max_steps or len(docqa.read_jsonl(docqa.OUT / "train.jsonl")) // groups_per_batch
+    steps = end - (last.batch if last else 0)
+    _guard(steps * step_usd, _remaining(budget))
+    lr = lr or train.learning_rate()
+    typer.echo(f"learning rate {lr:.3g}; steps {end - steps}..{end} -> {log_path}", err=True)
+    train.run(train.config(str(log_path), lr, groups_per_batch, group_size, max_steps, every=every))
+
+    usd = sum(docqa.rl_cost(r) for r in docqa.read_jsonl(metrics)[before:])
+    total = docqa.log_spend(f"train docqa {run}", usd, lr=lr, groups_per_batch=groups_per_batch,
+                            group_size=group_size, steps=f"{end - steps}..{end}")
+    typer.echo(f"${usd:.2f} this run (total ${total:.2f}); checkpoints: {log_path / 'checkpoints.jsonl'}")
 
 
 @score_app.command("verifier")
@@ -169,8 +298,11 @@ def _eval_verifier_gdp_pdf(checker: str, cfg, run: Path, budget: float) -> None:
 
 @eval_app.command("gdp-pdf")
 def eval_gdp_pdf(
-    model: Annotated[str, typer.Option(help="Tinker base model.")] = "thinkingmachines/Inkling-Small",
-    out: Annotated[Path, typer.Option(help="Run directory for results.jsonl.")] = Path("var/runs/m1"),
+    system: Annotated[str, typer.Option(help="baseline (one sample per task) | process (process(): router + "
+                                             "workers) | service (extract through the service SDK).")] = "baseline",
+    model: Annotated[str, typer.Option(help="baseline: Tinker base model.")] = "thinkingmachines/Inkling-Small",
+    out: Annotated[Path | None, typer.Option(help="Run directory for results.jsonl; default var/runs/m1 (baseline), "
+                                                  "var/runs/m2 (process), or var/runs/service.")] = None,
     data: Annotated[Path, typer.Option(help="GDP.pdf directory.")] = gdp_pdf.DEFAULT_DIR,
     limit: Annotated[int | None, typer.Option(help="Only the first N tasks.")] = None,
     max_tokens: Annotated[int, typer.Option(help="Completion token cap.")] = 4096,
@@ -178,15 +310,27 @@ def eval_gdp_pdf(
     concurrency: Annotated[int, typer.Option(help="Parallel Tinker requests.")] = 8,
     effort: Annotated[float, typer.Option(help="Reasoning effort for the tml_v0 renderer, in [0, 1).")] = 0.9,
     rerun_truncated: Annotated[bool, typer.Option(help="Also re-answer rows whose answer hit max tokens.")] = False,
+    workers: Annotated[int, typer.Option(help="process: worker threads for each document.")] = 4,
+    url: Annotated[str, typer.Option(help="service: URL of `gdpsolve serve`.")] = "http://127.0.0.1:8787",
     budget: Budget = 5.0,
 ) -> None:
-    """Baseline answers on GDP.pdf (evaluation only); resumes from results.jsonl."""
+    """Answers on GDP.pdf (evaluation only); resumes from results.jsonl.
+
+    Example: gdpsolve eval gdp-pdf --system process --limit 20 --out var/runs/m2
+    """
     import asyncio
     import json
 
     from gdpsolve.eval import baseline
 
+    if system not in ("baseline", "process", "service"):
+        raise typer.BadParameter("--system must be baseline, process, or service")
     tasks = gdp_pdf.load_tasks(data)[:limit]
+    if system == "service":
+        return _eval_gdp_pdf_service(tasks, out or Path("var/runs/service"), data, url, concurrency)
+    if system == "process":
+        return _eval_gdp_pdf_process(tasks, out or Path("var/runs/m2"), data, workers, budget)
+    out = out or Path("var/runs/m1")
     out.mkdir(parents=True, exist_ok=True)
     results = out / "results.jsonl"
     todo = baseline.pending(tasks, results, rerun_truncated)
@@ -211,6 +355,147 @@ def eval_gdp_pdf(
                                               for r in new)}
         logger.log_metrics(counts)
     typer.echo(f"{results}: {json.dumps(counts)}")
+
+
+def _eval_gdp_pdf_process(tasks: list[dict], out: Path, data: Path, workers: int, budget: float) -> None:
+    """M2: process() for each task without an ok row; logs status counts, cost, and latency percentiles."""
+    import json
+
+    from gdpsolve import run
+    from gdpsolve.eval import baseline
+
+    out.mkdir(parents=True, exist_ok=True)
+    results = out / "results.jsonl"
+    todo = baseline.pending(tasks, results)
+    typer.echo(f"{len(todo)} tasks to answer ({len(tasks) - len(todo)} done)", err=True)
+    _guard(len(todo) * run.MAX_COST_PER_DOC, budget)
+    dataset = f"{gdp_pdf.DEFAULT_REPO}@{gdp_pdf.DEFAULT_REVISION}"
+    with _traced(out / "process", system="process", model=run.MODEL, effort=run.EFFORT, workers=workers,
+                 max_cost_per_doc=run.MAX_COST_PER_DOC, dataset=dataset) as logger:
+        new = run.run_eval(todo, data, results, workers=workers)
+        ids = {t["task_id"] for t in tasks}
+        rows = [r for r in baseline.done(results).values() if r["request_id"] in ids]
+        latencies = sorted(r["latency_s"] for r in rows if r.get("latency_s") is not None)
+
+        def pct(q: float) -> float | None:
+            return latencies[min(len(latencies) - 1, int(q * len(latencies)))] if latencies else None
+
+        counts = {**{s: sum(r["status"] == s for r in rows) for s in ("ok", "partial", "failed", "password_required")},
+                  "tinker_cost_this_run": sum(r["cost"] for r in new), "latency_p50": pct(0.5),
+                  "latency_p95": pct(0.95)}
+        logger.log_metrics(counts)
+    typer.echo(f"{results}: {json.dumps(counts)}")
+
+
+def _eval_gdp_pdf_service(tasks: list[dict], out: Path, data: Path, url: str, concurrency: int) -> None:
+    """Each task without an ok row through the service SDK (upload, then extract), `concurrency` at a time.
+
+    Rows have the baseline format; latency_s is the client wall time for the document. Writes run.json.
+    """
+    import json
+    import threading
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    from gdpsolve.client import GDPSolve
+    from gdpsolve.eval import baseline, pdf_input
+    from gdpsolve.schemas import ExtractionResult
+
+    out.mkdir(parents=True, exist_ok=True)
+    results = out / "results.jsonl"
+    todo = baseline.pending(tasks, results)
+    sdk = GDPSolve(url)
+    config = sdk.health()["config"]
+    typer.echo(f"{len(todo)} tasks to answer ({len(tasks) - len(todo)} done) via {url}: {json.dumps(config)}",
+               err=True)
+    meta = {t["task_id"]: pdf_input.metadata(data / t["pdf_path"]) for t in todo}  # pdfium is not thread-safe
+    lock = threading.Lock()
+    new: list[tuple[dict, float]] = []
+
+    def one(task: dict) -> None:
+        start = time.monotonic()
+        run = {"model": config["model"], "effort": config["effort"], "truncated_at_page": None}
+        cost = 0.0
+        try:
+            file_id = sdk.upload(data / task["pdf_path"])["file_id"]
+            r = sdk.extract.run(input=file_id, instructions={"schema": {}, "system_prompt": task["prompt"]})
+            result = ExtractionResult(request_id=task["task_id"], document=meta[task["task_id"]], status="ok",
+                                      answer=r["result"][0]["answer"])
+            run |= {"truncated_at_page": r["truncated_at_page"], "prompt_tokens": r["usage"]["prompt_tokens"],
+                    "completion_tokens": r["usage"]["completion_tokens"], "finish": r["finish"],
+                    "prompt_sha256": r["prompt_sha256"]}
+            cost = r["usage"]["cost_usd"]
+        except Exception as e:  # noqa: BLE001 -- recorded as a failed row; resume retries it
+            result = ExtractionResult(request_id=task["task_id"], document=meta[task["task_id"]], status="failed",
+                                      error=f"{type(e).__name__}: {e}")
+        result.latency_s = round(time.monotonic() - start, 2)
+        row = result.model_dump(mode="json") | run
+        with lock:
+            with results.open("a") as f:
+                f.write(json.dumps(row) + "\n")
+            new.append((row, cost))
+        typer.echo(f"{result.request_id} {result.status} {result.latency_s}s", err=True)
+
+    start = time.monotonic()
+    with ThreadPoolExecutor(concurrency) as pool:
+        list(pool.map(one, todo))
+    wall = time.monotonic() - start
+    latencies = sorted(row["latency_s"] for row, _ in new)
+
+    def pct(q: float) -> float | None:
+        return latencies[min(len(latencies) - 1, int(q * len(latencies)))] if latencies else None
+
+    stats = {"system": "service", "n": len(new), "wall_s": round(wall, 3),
+             "throughput_docs_per_min": round(len(new) / wall * 60, 2), "latency_p50": pct(0.5),
+             "latency_p95": pct(0.95), "cost_usd": sum(c for _, c in new),
+             "ok": sum(row["status"] == "ok" for row, _ in new), "url": url, "config": config}
+    (out / "run.json").write_text(json.dumps(stats, indent=2) + "\n")
+    typer.echo(f"{results}: {json.dumps(stats)}")
+
+
+@app.command("serve")
+def serve(
+    host: Annotated[str, typer.Option(help="Address to listen on.")] = "127.0.0.1",
+    port: Annotated[int, typer.Option(help="Port to listen on.")] = 8787,
+    workers: Annotated[int, typer.Option(help="Worker threads: jobs that run at the same time.")] = 8,
+    parser: Annotated[str, typer.Option(help="native (text layer; pages without one as images) | paddle "
+                                             "(pages without a text layer through PaddleOCR-VL).")] = "native",
+    model: Annotated[str, typer.Option(help="Tinker base model.")] = "thinkingmachines/Inkling-Small",
+    checkpoint: Checkpoint = None,
+    effort: Annotated[float, typer.Option(help="Reasoning effort for the tml_v0 renderer, in [0, 1).")] = 0.3,
+    max_tokens: Annotated[int, typer.Option(help="Completion token cap.")] = 8192,
+    token_budget: Annotated[int, typer.Option(help="PDF content token budget.")] = 120_000,
+) -> None:
+    """Run the document service (docs/service-spec.md) until stopped."""
+    from gdpsolve import run, service
+
+    if parser not in ("native", "paddle"):
+        raise typer.BadParameter("--parser must be native or paddle")
+    if parser == "paddle":
+        run.ensure_ocr_server()
+    cfg = service.Config(parser=parser, model=model, checkpoint=checkpoint, effort=effort, max_tokens=max_tokens,
+                         token_budget=token_budget)
+    typer.echo(f"serving on http://{host}:{port} with {workers} workers: {cfg.settings()}", err=True)
+    service.serve(cfg, host, port, workers)
+
+
+@app.command("extract")
+def extract(
+    path: Annotated[Path, typer.Argument(help="A PDF, or a directory: one request for each *.pdf in it.")],
+    instructions: Annotated[str, typer.Option("--instructions", "-i", help="What to extract.")],
+    password: Annotated[list[str] | None, typer.Option(help="Password to try; repeat for more.")] = None,
+    workers: Annotated[int, typer.Option(help="Worker threads for each document.")] = 4,
+) -> None:
+    """Run process() on each PDF; one ExtractionResult JSON per line on stdout."""
+    from pydantic import SecretStr
+
+    from gdpsolve import run
+    from gdpsolve.schemas import ExtractionRequest
+
+    pdfs = sorted(path.glob("*.pdf")) if path.is_dir() else [path]
+    for pdf in pdfs:
+        req = ExtractionRequest(path=pdf, instructions=instructions, passwords=[SecretStr(p) for p in password or []])
+        typer.echo(run.process(req, workers=workers).model_dump_json())
 
 
 @score_app.command("gdp-pdf")

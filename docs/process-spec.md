@@ -98,7 +98,7 @@ def process(req, policy=None, recognizer=None, workers=4) -> ExtractionResult:
         run.put_merge_job_when_children_ended()
     for _ in threads:
         run.jobs.put(None)                # stop signal
-    return merge(doc, req, run.reports)
+    return merge(doc, req, run.reports, run.final_id, root_id)
 ```
 
 `Run` holds the state of one request:
@@ -243,8 +243,8 @@ Give the model the prompt for the mode:
   - Make child jobs of at least 5 pages each. Make no more than 16 child jobs.
   - Make one `merge` job with `after` set to the child jobs. Put it in the queue only when all child jobs have ended.
   - If less than 120 s is left, return `[]`.
-- `merge(doc, req, reports) -> ExtractionResult`. Do not call a model.
-  1. If the merge job has a `ready` report, use its answer and fields.
+- `merge(doc, req, reports, final_id, root_id) -> ExtractionResult`. Do not call a model.
+  1. If the final job (`final_id`: the merge job after a split, else the root job) has a `ready` report, use its answer and fields.
   2. If not, and the root job has a `ready` report, use the root report.
   3. If not, join the answers of the `ready` reports. Set `status="partial"`.
   4. If no report is `ready`, set `status="failed"`.
@@ -302,4 +302,39 @@ GDP.pdf is for evaluation only. Do not change prompts, tools, or limits because 
 
 ## 7. Results
 
-To be completed by T8.
+### 7.1 Milestone check, 2026-11-02 (v0, first 20 GDP.pdf tasks, official judge)
+
+| System | `all_pass` | `mean_criteria` | Graded |
+|---|---|---|---|
+| M1 baseline (single prompt) | 0.05 | 0.479 | 20/20 |
+| `process()` v0 | **0.00** | **0.183** | 9/20 |
+
+- 11 of 20 tasks ended `failed` with an empty answer. They count as 0 here, as in the official metric.
+  `score gdp-pdf` grades only `ok` rows, so its own summary (0.406 on 9 tasks) leaves them out.
+- On the 9 tasks that v0 answered, M1 scores 0.596 and v0 scores 0.406.
+- Latency: p50 10.1 s, p95 22.4 s. This is far below the 300 s limit.
+- Spend: Tinker $0.14 (20 tasks). Gemini: 36k input and 47k output tokens.
+
+**Result: v0 does not beat M1. Do not use v0.**
+
+### 7.2 Cause (from `var/runs/m2/process/calls.jsonl`)
+
+The trace has 86 steps: 42 `read_native_text`, 26 `report`, 13 `inspect_pdf`, 3 `post`, 2 `split`.
+`render`, `crop`, and `recognize` were not used.
+
+1. `read_native_text` reads one page for each call. The step limit is `min(40, 8 + pages // 5)`.
+   A 60-page or 192-page document cannot be read in that budget.
+2. The policy reports `failed` early when it sees this ("insufficient steps to scan 192 pages").
+   A `failed` report has no answer, so the task gets 0. M1 always gives an answer.
+3. 2 reports had no tool call, which also gives `failed`.
+4. `trace_events.jsonl` is empty. `TinkerPolicy` calls the sync sample method, and the cookbook only instruments the async methods.
+
+### 7.3 Changes for v1 (not done; validate on synthetic long PDFs, not on GDP.pdf)
+
+1. `read_native_text` takes a page range (for example `pages: [1, 30]`) and a token cap. One call can read many pages, like the M1 prompt.
+2. Give the first observation the document outline and the first pages of text, so the policy starts with context.
+3. A forced or `failed` report must still give the best answer so far. `merge` uses a non-empty answer from any report before it returns `failed`.
+4. Base the limit on tokens and time, not only on steps.
+5. Use `sample_async` in `TinkerPolicy`, so the Tinker timing trace works.
+
+GDP.pdf is for evaluation only. Run the 20-task check again only after v1 passes on synthetic long documents.
