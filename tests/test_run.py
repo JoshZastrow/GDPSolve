@@ -155,12 +155,7 @@ def test_config():
 
 STUBS = [
     ("ingest", lambda r: run.ingest(r.req)),
-    ("inspect_pdf", lambda r: run.inspect_pdf(r, None)),
-    ("read_native_text", lambda r: run.read_native_text(r, None)),
-    ("render", lambda r: run.render(r, None)),
-    ("crop", lambda r: run.crop(r, None)),
     ("recognize", lambda r: run.recognize(r, None)),
-    ("run_tool", lambda r: run.run_tool(r, None, "inspect_pdf", {"page": 1})),
     ("ensure_ocr_server", lambda r: run.ensure_ocr_server()),
     ("PaddleRecognizer", lambda r: run.PaddleRecognizer()(None, "text")),
     ("TinkerPolicy", lambda r: run.TinkerPolicy().step([])),
@@ -186,6 +181,113 @@ def test_stub_raises_not_implemented(tmp_path, name, call):
 
 
 # --- T2 ---
+
+
+def doc_run(tmp_path, monkeypatch, pdf: bytes, recognizer=None) -> run.Run:
+    """A Run over `pdf`, with the store in tmp_path."""
+    from gdpsolve.schemas import Document, DocumentMetadata
+    from gdpsolve.verifier import store
+
+    monkeypatch.chdir(tmp_path)
+    ref = store.put(pdf, "application/pdf")
+    meta = DocumentMetadata(filename="a.pdf", sha256=ref.sha256, page_count=len(pdfium.PdfDocument(pdf)),
+                            encrypted=False, has_text_layer=True)
+    r = make_run(tmp_path, recognizer=recognizer)
+    r.doc = Document(metadata=meta, pdf=ref)
+    return r
+
+
+def test_read_native_text_is_the_page_text(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello", "Total due 42"]))
+    assert run.read_native_text(r, run.ReadNativeText(page=2)) == "Total due 42"
+
+
+def test_read_native_text_in_a_box(tmp_path, monkeypatch):
+    from gdpsolve.schemas import BoundingBox
+
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    # boxes are in points from the top left; the text baseline is at 792 - 700 = 92
+    inside = BoundingBox(page=1, x0=60, y0=60, x1=300, y1=110)
+    outside = BoundingBox(page=1, x0=60, y0=400, x1=300, y1=500)
+    assert run.read_native_text(r, run.ReadNativeText(page=1, bbox=inside)) == "Hello"
+    assert run.read_native_text(r, run.ReadNativeText(page=1, bbox=outside)) == ""
+
+
+def test_inspect_pdf_text_page(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    out = run.inspect_pdf(r, run.InspectPdf(page=1))
+    assert "612 x 792" in out and "rotation 0" in out
+    assert "has_text_layer=True" in out and "image_cover=0.00" in out
+
+
+def test_inspect_pdf_scan_has_no_text_layer(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_scan("Hello"))
+    out = run.inspect_pdf(r, run.InspectPdf(page=1))
+    assert "has_text_layer=False" in out and "image_cover=1.00" in out
+
+
+def test_render_gives_a_region_with_a_png_in_the_store(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from gdpsolve.verifier import store
+
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    region = run.render(r, run.Render(page=1, dpi=72))
+    assert region.page == 1 and region.dpi == 72 and region.bbox is None and region.ops == []
+    assert region.doc_sha256 == r.doc.metadata.sha256 and region.image.media_type == "image/png"
+    assert r.regions[region.id] == region
+    image = Image.open(io.BytesIO(store.get(region.image)))
+    assert image.format == "PNG" and image.size == (612, 792)
+    assert region.id != run.render(r, run.Render(page=1, dpi=100)).id
+
+
+def test_crop_gives_a_padded_region(tmp_path, monkeypatch):
+    from PIL import Image
+
+    from gdpsolve.schemas import BoundingBox
+    from gdpsolve.verifier import store
+
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    box = BoundingBox(page=1, x0=100, y0=100, x1=200, y1=150)
+    region = run.crop(r, run.Crop(page=1, bbox=box, padding=10, dpi=144))
+    assert (region.bbox.x0, region.bbox.y0, region.bbox.x1, region.bbox.y1) == (90, 90, 210, 160)
+    assert Image.open(io.BytesIO(store.get(region.image))).size == (240, 140)
+    assert r.regions[region.id] == region
+
+
+def test_same_arguments_make_one_memo_entry(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    assert run.read_native_text(r, run.ReadNativeText(page=1)) == "Hello"
+    assert run.read_native_text(r, run.ReadNativeText(page=1)) == "Hello"
+    assert len(r.memo) == 1
+    a = run.render(r, run.Render(page=1, dpi=72))
+    b = run.render(r, run.Render(page=1, dpi=72))
+    assert a == b and len(r.memo) == 2 and len(r.regions) == 1
+
+
+def test_run_tool_gives_content_parts(tmp_path, monkeypatch):
+    r = doc_run(tmp_path, monkeypatch, make_pdf(["Hello"]))
+    assert run.run_tool(r, None, "read_native_text", {"page": 1}) == [{"type": "text", "text": "Hello"}]
+    parts = run.run_tool(r, None, "render", {"page": 1, "dpi": 72})
+    assert [p["type"] for p in parts] == ["text", "image"]
+    assert next(iter(r.regions)) in parts[0]["text"] and parts[1]["image"].size == (612, 792)
+    with pytest.raises(ValueError):
+        run.run_tool(r, None, "detect_layout", {"page": 1})
+
+
+def test_run_tool_split_and_post_go_to_the_thread(tmp_path, monkeypatch):
+    from gdpsolve.schemas import Document, DocumentMetadata, Job, ObjectRef
+
+    r = make_run(tmp_path)
+    meta = DocumentMetadata(filename="a.pdf", sha256="0" * 64, page_count=1, encrypted=False, has_text_layer=True)
+    doc = Document(metadata=meta, pdf=ObjectRef(sha256="0" * 64, media_type="application/pdf", size=1))
+    job = Job(id="j1", request_id=r.req.id, document=doc, instructions="q", deadline_at="2030-01-01T00:00:00Z")
+    assert run.run_tool(r, job, "post", {"kind": "note", "pages": [3], "note": "n"}) == [
+        {"type": "text", "text": "posted"}]
+    assert run.run_tool(r, job, "split", {"pages_per_job": 5}) == [{"type": "text", "text": "split requested"}]
+    note, split = r.thread
+    assert (note.thread, note.job_id, note.kind, note.pages, note.note) == (r.req.id, "j1", "note", [3], "n")
+    assert (split.kind, split.pages_per_job) == ("split", 5) and r.events.get_nowait() is split
 
 
 # --- T3 ---
