@@ -236,6 +236,8 @@ There is no daemon or server. Everything runs on one machine, and only model sam
 
 ## Planned modules
 
+v0 puts `process()`, the router, the worker loop and the tools in one file, `src/gdpsolve/run.py`, with an in-process thread pool instead of the SQLite queue ([`process-spec.md`](process-spec.md)). The layout below is the longer-term target.
+
 ```
 src/gdpsolve/
   pipeline.py   process()

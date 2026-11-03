@@ -256,7 +256,7 @@ All scripts, runs, and pipelines are `gdpsolve <action> <resource>` subcommands 
 |---|---|---|
 | M0 | Repo, uv environment, dataset, TRD *(this commit)* | `uv run pytest` passes; 100 PDFs present |
 | M1 | Baseline: Inkling-Small, single pass, PDF text layer + scanned-page images, official scorer ([`m1-baseline.md`](m1-baseline.md)) | Baseline strict pass rate and mean rubric score recorded |
-| M2 | Pipeline: SDK, queue, heuristic router, tool-using workers, grounding, metadata, passwords | All FRs pass integration tests; p95 < 5 min on GDP.pdf |
+| M2 | Pipeline: SDK, queue, heuristic router, tool-using workers, grounding, metadata, passwords ([`process-spec.md`](process-spec.md)) | All FRs pass integration tests; p95 < 5 min on GDP.pdf |
 | M3 | Synthetic environment: `tinker_cookbook.rl.Env`, generators for tables, floor plans, and encrypted docs, rubric authoring, contamination guard | 2k+ tasks; contamination check is clean |
 | M4 | RL: worker SDPO++ on Tinker | Improvement on the synthetic held-out set; GDP.pdf milestone run |
 | M5 | Co-training the router | Strict pass rate > 10% at p95 < 5 min |
