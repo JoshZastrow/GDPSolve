@@ -9,14 +9,14 @@ import pypdfium2 as pdfium
 from gdpsolve.schemas import DocumentMetadata
 
 
-def metadata(path: Path) -> DocumentMetadata:
-    pdf = pdfium.PdfDocument(path)
+def metadata(path: Path, password: str | None = None) -> DocumentMetadata:
+    pdf = pdfium.PdfDocument(path, password=password)
     info = pdf.get_metadata_dict(skip_empty=True)
     return DocumentMetadata(
         filename=path.name,
         sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
         page_count=len(pdf),
-        encrypted=False,  # pdfium raises on encrypted PDFs without a password
+        encrypted=password is not None,  # pdfium raises on encrypted PDFs without a password
         has_text_layer=any(page_text(page) for page in pdf),
         title=info.get("Title"),
         author=info.get("Author"),

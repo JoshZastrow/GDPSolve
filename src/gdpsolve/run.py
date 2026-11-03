@@ -104,8 +104,44 @@ class Run:
 
 
 def ingest(req: ExtractionRequest) -> Document | ExtractionResult:
-    """Hash the file, try the passwords, read the metadata, and store the bytes; or a failed/password_required result."""
-    raise NotImplementedError
+    """Hash the file, try the passwords, read the metadata, and store the bytes; or a failed/password_required result.
+
+    An encrypted PDF is stored decrypted, so the tools open `doc.pdf` without a password.
+    """
+    import hashlib
+    import io
+
+    import pypdfium2 as pdfium
+    import pypdfium2.raw as pdfium_c
+
+    from gdpsolve.eval import pdf_input
+    from gdpsolve.schemas import DocumentMetadata
+    from gdpsolve.verifier import store
+
+    def result(status: str, sha: str = "", encrypted: bool = False, error: str | None = None) -> ExtractionResult:
+        meta = DocumentMetadata(filename=req.path.name, sha256=sha, page_count=0, encrypted=encrypted,
+                                has_text_layer=False)
+        return ExtractionResult(request_id=req.id, document=meta, status=status, error=error)
+
+    try:
+        data = req.path.read_bytes()
+    except OSError as e:
+        return result("failed", error=str(e))
+    sha = hashlib.sha256(data).hexdigest()
+    for password in [None, *(p.get_secret_value() for p in req.passwords)]:
+        try:
+            pdf = pdfium.PdfDocument(data, password=password)
+            break
+        except pdfium.PdfiumError as e:
+            if e.err_code != pdfium_c.FPDF_ERR_PASSWORD:
+                return result("failed", sha, error=str(e))
+    else:
+        return result("password_required", sha, encrypted=True)
+    if password is not None:
+        buf = io.BytesIO()
+        pdf.save(buf, flags=pdfium_c.FPDF_REMOVE_SECURITY)
+        data = buf.getvalue()
+    return Document(metadata=pdf_input.metadata(req.path, password), pdf=store.put(data, "application/pdf"))
 
 
 # --- tools ---
