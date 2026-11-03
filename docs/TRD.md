@@ -138,7 +138,7 @@ Key levers:
 - The environment is a `tinker_cookbook.rl.Env` running in-process over these documents. Its tools are the same code as the production tools.
 
 ### 8.2 Co-training router and worker
-- **Episode.** The router samples a plan. Workers roll out under that plan. The aggregator produces an answer, and the learned verifier scores it against the rubric, one P(pass) per criterion ([`verifier.md`](verifier.md)).
+- **Episode.** The router samples a plan. Workers roll out under that plan. The aggregator produces an answer, and the learned verifier scores it against the rubric, one P(pass) per criterion ([`verifier.md`](verifier.md); training and serving plan: [`verifier-trd.md`](verifier-trd.md)).
 - **Worker reward:** rubric score (fraction of criteria passed), plus a bonus for all criteria passing, plus a grounding validity bonus, minus a penalty for invalid citations.
 - **Router reward:** the same task reward minus λ·latency and μ·tool-cost, with a hard penalty when the plan violates the SLA.
 - **Schedule:** alternating updates (freeze one, update the other) to start, moving to joint updates once both are stable.
@@ -255,7 +255,7 @@ All scripts, runs, and pipelines are `gdpsolve <action> <resource>` subcommands 
 | Milestone | Scope | Exit criterion |
 |---|---|---|
 | M0 | Repo, uv environment, dataset, TRD *(this commit)* | `uv run pytest` passes; 100 PDFs present |
-| M1 | Baseline: Inkling-Small, single pass, PDF attached, through the Inspect harness | Baseline strict pass rate and mean rubric score recorded |
+| M1 | Baseline: Inkling-Small, single pass, PDF text layer + scanned-page images, official scorer ([`m1-baseline.md`](m1-baseline.md)) | Baseline strict pass rate and mean rubric score recorded |
 | M2 | Pipeline: SDK, queue, heuristic router, tool-using workers, grounding, metadata, passwords | All FRs pass integration tests; p95 < 5 min on GDP.pdf |
 | M3 | Synthetic environment: `tinker_cookbook.rl.Env`, generators for tables, floor plans, and encrypted docs, rubric authoring, contamination guard | 2k+ tasks; contamination check is clean |
 | M4 | RL: worker SDPO++ on Tinker | Improvement on the synthetic held-out set; GDP.pdf milestone run |

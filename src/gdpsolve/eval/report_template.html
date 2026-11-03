@@ -1,0 +1,461 @@
+<!doctype html>
+<!--
+  Verifier evaluation report: rubric verifier vs. official GDP.pdf verdicts (docs/verifier.md §7).
+
+  To render: replace the contents of <script id="report-data"> with JSON of this shape
+  (escape "</" as "<\/" in strings). Everything else is computed in the page.
+
+  {
+    "meta": {
+      "checker": "rubric",                      // --checker
+      "data": "gdp-pdf",                        // --data
+      "labels": "Official Gemini 3.5 Flash verdicts (eval_only)",
+      "dataset": "Oitaaa/GDP.pdf@7f76578",
+      "generated_at": "2026-11-02T13:00:00Z",
+      "sample": false,                          // true shows the "sample data" banner
+      "baseline": {                             // optional: M1 headline from summary.json (official scorer)
+        "model": "thinkingmachines/Inkling-Small", "judge": "google/gemini-3.5-flash",
+        "all_pass": 0.12, "mean_criteria": 0.61, "n_tasks": 100,
+        "effort_counts": {"0.9": 17, "0.3": 83},   // answers per renderer effort (a mixed config is disclosed)
+        "hit_max_tokens": 4                       // answers that still hit the completion token cap
+      }
+    },
+    "models": [                                 // one bar series each, in this order (1 to 3); the
+                                                // gain tile needs a "baseline" role, the ceiling delta a "ceiling" role
+      {"ref": "<CheckerConfig.model_ref>", "label": "Trained verifier", "role": "verifier"},
+      {"ref": "Qwen/Qwen3.8-27B", "label": "Zero-shot base", "role": "baseline"},
+      {"ref": "thinkingmachines/Inkling", "label": "Labeling judge (ceiling)", "role": "ceiling"}
+    ],
+    "decisions": [                              // one per (GDP.pdf response, criterion)
+      {
+        "task_id": "…", "criterion_id": "c1",
+        "criterion": "<Criterion.text>", "type": "Primary Intent" | "Dodged Bullet",
+        "severity": "Certain dealbreaker" | "Possible dealbreaker" | "Unlikely dealbreaker" | null,
+        "response": "<VerifyRequest.response>",
+        "label": 1 | 0,                         // official verdict: 1 = pass
+        "p": {"<model ref>": 0.97 | null},      // CriterionScore.p_pass; null = unscored
+        "request_id": "…",                      // results.jsonl row whose answer is `response`
+        "prompt_sha256": "…"                    // that row's decoded prompt in var/objects/
+      }
+    ]
+  }
+
+  Provenance: with "sample": false, report.render() refuses decisions without request_id and
+  prompt_sha256. Made-up data must set "sample": true.
+
+  Metric: Brier reward = 1 − mean((p − label)²) over scored decisions. Agreement = share of
+  scored decisions where (p ≥ 0.5) matches the label. Lowest-scoring decisions are the
+  "verifier"-role model's decisions with the largest (p − label)².
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verifier Eval Report</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-0: #f5f4f1;
+    --surface-1: #fcfcfb;
+    --grid: #e4e3df;
+    --border: #dddcd7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #7a7974;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --bad-bg: #fbe9e8;
+    --bad-ink: #a32524;
+    --warn-bg: #fdf1d6;
+    --warn-ink: #7a5300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-0: #121211;
+      --surface-1: #1a1a19;
+      --grid: #2e2e2c;
+      --border: #3a3a37;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted: #8f8e86;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --bad-bg: #3a1c1b;
+      --bad-ink: #f2a3a2;
+      --warn-bg: #36290e;
+      --warn-ink: #f0c869;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-0: #121211;
+    --surface-1: #1a1a19;
+    --grid: #2e2e2c;
+    --border: #3a3a37;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #8f8e86;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --bad-bg: #3a1c1b;
+    --bad-ink: #f2a3a2;
+    --warn-bg: #36290e;
+    --warn-ink: #f0c869;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--surface-0); color: var(--text-primary);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 960px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); margin: 0; }
+  .muted { color: var(--text-muted); font-size: 13px; }
+  code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, monospace; overflow-wrap: anywhere; }
+  .banner {
+    background: var(--warn-bg); color: var(--warn-ink); border-radius: 8px;
+    padding: 8px 12px; margin: 16px 0 0; font-size: 14px;
+  }
+  .meta { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 16px 0 0; font-size: 13px; }
+  .meta dt { color: var(--text-muted); }
+  .meta dd { margin: 0; color: var(--text-secondary); min-width: 0; }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px;
+    padding: 20px; margin-top: 20px;
+  }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-top: 20px; }
+  .tiles:empty { display: none; }
+  .tile { background: var(--surface-1); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .tile .label { color: var(--text-secondary); font-size: 13px; }
+  .tile .value { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .delta { color: var(--text-muted); font-size: 12.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin: 12px 0 4px; font-size: 13px; color: var(--text-secondary); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 3px; display: inline-block; }
+  #chart { width: 100%; position: relative; }
+  #chart svg { display: block; width: 100%; height: auto; overflow: visible; }
+  #chart text { font: 12px system-ui, sans-serif; fill: var(--text-secondary); }
+  #chart .group-label { fill: var(--text-primary); font-weight: 500; }
+  #chart .value { fill: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  #chart .grid { stroke: var(--grid); stroke-width: 1; }
+  #chart .hit { fill: transparent; }
+  .tooltip {
+    position: absolute; pointer-events: none; background: var(--surface-1); color: var(--text-primary);
+    border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; font-size: 12.5px;
+    box-shadow: 0 4px 16px rgb(0 0 0 / .12); white-space: nowrap; display: none; z-index: 2;
+  }
+  .tooltip b { font-variant-numeric: tabular-nums; }
+  details.table-view { margin-top: 12px; font-size: 13px; }
+  details.table-view summary { cursor: pointer; color: var(--text-secondary); }
+  .table-wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th { color: var(--text-muted); font-weight: 500; }
+  .examples { display: grid; gap: 12px; margin-top: 12px; }
+  .ex { border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .ex-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; }
+  .pill { font-size: 12px; border-radius: 999px; padding: 1px 8px; background: var(--surface-0); color: var(--text-secondary); border: 1px solid var(--border); }
+  .pill.bad { background: var(--bad-bg); color: var(--bad-ink); border-color: transparent; font-weight: 600; }
+  .ex-crit { margin: 8px 0 6px; font-weight: 500; }
+  .ex-nums { display: flex; flex-wrap: wrap; gap: 4px 18px; font-size: 13px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .ex-nums b { color: var(--text-primary); }
+  .ex details { margin-top: 8px; font-size: 13.5px; }
+  .ex summary { cursor: pointer; color: var(--text-secondary); }
+  .ex pre { white-space: pre-wrap; overflow-wrap: anywhere; font: 13px/1.5 ui-monospace, Menlo, monospace; background: var(--surface-0); padding: 10px 12px; border-radius: 8px; margin: 8px 0 0; max-height: 320px; overflow: auto; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-top: 8px; font-size: 13px; color: var(--text-secondary); }
+  select { font: inherit; color: var(--text-primary); background: var(--surface-1); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; max-width: 100%; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Verifier evaluation</h1>
+    <p class="sub" id="subtitle"></p>
+    <div id="banner"></div>
+    <dl class="meta" id="meta"></dl>
+  </header>
+
+  <section class="tiles" id="baseline" aria-label="Baseline on GDP.pdf"></section>
+
+  <section class="tiles" id="tiles" aria-label="Headline metrics"></section>
+
+  <section class="card" aria-labelledby="chart-title">
+    <h2 id="chart-title">Brier reward by criterion slice</h2>
+    <p class="muted">1 − mean((p − official verdict)²). Higher is better; 1.0 is perfect and calibrated.<span id="ceiling-note"> The labeling judge is the ceiling, since the verifier is distilled from it.</span></p>
+    <div class="legend" id="legend"></div>
+    <div id="chart"><div class="tooltip" id="tooltip" role="status"></div></div>
+    <details class="table-view">
+      <summary>Show as table</summary>
+      <div class="table-wrap"><table id="chart-table"></table></div>
+    </details>
+  </section>
+
+  <section class="card" aria-labelledby="ex-title">
+    <h2 id="ex-title">Lowest-scoring decisions</h2>
+    <p class="muted" id="ex-sub"></p>
+    <div class="controls">
+      <label>Show
+        <select id="ex-filter">
+          <option value="all">all, by error</option>
+          <option value="fp">false passes (verdict fail, verifier pass)</option>
+          <option value="fn">false fails (verdict pass, verifier fail)</option>
+        </select>
+      </label>
+      <label>Top
+        <select id="ex-n"><option>10</option><option>25</option><option>50</option></select>
+      </label>
+    </div>
+    <div class="examples" id="examples"></div>
+  </section>
+</main>
+
+<script type="application/json" id="report-data">
+{
+  "meta": {
+    "checker": "rubric",
+    "data": "gdp-pdf",
+    "labels": "Official Gemini 3.5 Flash verdicts (eval_only)",
+    "dataset": "Oitaaa/GDP.pdf@7f76578",
+    "generated_at": "2026-11-02T13:00:00Z",
+    "sample": true
+  },
+  "models": [
+    {"ref": "tinker://sample-run/sampler_weights/000128", "label": "Trained verifier", "role": "verifier"},
+    {"ref": "Qwen/Qwen3.8-27B", "label": "Zero-shot base", "role": "baseline"},
+    {"ref": "thinkingmachines/Inkling", "label": "Labeling judge (ceiling)", "role": "ceiling"}
+  ],
+  "decisions": [
+    {"task_id": "t01", "criterion_id": "c1", "criterion": "The response should state YTD revenue: $7.4M.", "type": "Primary Intent", "severity": "Certain dealbreaker", "response": "YTD revenue was $7.4M through June.", "label": 1, "p": {"tinker://sample-run/sampler_weights/000128": 0.97, "Qwen/Qwen3.8-27B": 0.81, "thinkingmachines/Inkling": 0.99}},
+    {"task_id": "t01", "criterion_id": "c2", "criterion": "The response should state the June gross margin: 41.2%.", "type": "Primary Intent", "severity": "Certain dealbreaker", "response": "YTD revenue was $7.4M through June.", "label": 0, "p": {"tinker://sample-run/sampler_weights/000128": 0.12, "Qwen/Qwen3.8-27B": 0.44, "thinkingmachines/Inkling": 0.03}},
+    {"task_id": "t02", "criterion_id": "c1", "criterion": "The response should avoid reporting the restated Q1 figure as the original.", "type": "Dodged Bullet", "severity": "Possible dealbreaker", "response": "Q1 operating income was $1.18M (as originally reported; restated to $1.05M in the Q2 filing).", "label": 1, "p": {"tinker://sample-run/sampler_weights/000128": 0.31, "Qwen/Qwen3.8-27B": 0.58, "thinkingmachines/Inkling": 0.88}},
+    {"task_id": "t02", "criterion_id": "c2", "criterion": "The response should state total headcount at period end: 214.", "type": "Primary Intent", "severity": "Unlikely dealbreaker", "response": "Headcount ended the period at roughly 210.", "label": 0, "p": {"tinker://sample-run/sampler_weights/000128": 0.83, "Qwen/Qwen3.8-27B": 0.71, "thinkingmachines/Inkling": 0.22}},
+    {"task_id": "t03", "criterion_id": "c1", "criterion": "The response should state the lease term: 7 years.", "type": "Primary Intent", "severity": "Certain dealbreaker", "response": "The lease runs for seven years starting March 2027.", "label": 1, "p": {"tinker://sample-run/sampler_weights/000128": 0.94, "Qwen/Qwen3.8-27B": 0.9, "thinkingmachines/Inkling": 0.97}},
+    {"task_id": "t03", "criterion_id": "c2", "criterion": "The response should avoid quoting the renewal option as the base term.", "type": "Dodged Bullet", "severity": "Certain dealbreaker", "response": "The lease runs for seven years starting March 2027.", "label": 1, "p": {"tinker://sample-run/sampler_weights/000128": 0.89, "Qwen/Qwen3.8-27B": 0.62, "thinkingmachines/Inkling": 0.93}},
+    {"task_id": "t04", "criterion_id": "c1", "criterion": "The response should state the floor area of Unit 4B: 1,120 sq ft.", "type": "Primary Intent", "severity": "Certain dealbreaker", "response": "Unit 4B is 1,210 sq ft per the floor plan.", "label": 0, "p": {"tinker://sample-run/sampler_weights/000128": 0.68, "Qwen/Qwen3.8-27B": 0.77, "thinkingmachines/Inkling": 0.09}},
+    {"task_id": "t04", "criterion_id": "c2", "criterion": "The response should state the number of bedrooms in Unit 4B: 2.", "type": "Primary Intent", "severity": "Possible dealbreaker", "response": "Unit 4B is 1,210 sq ft per the floor plan. It has two bedrooms.", "label": 1, "p": {"tinker://sample-run/sampler_weights/000128": 0.92, "Qwen/Qwen3.8-27B": 0.85, "thinkingmachines/Inkling": 0.96}},
+    {"task_id": "t05", "criterion_id": "c1", "criterion": "The response should avoid summing quarterly figures that are already cumulative.", "type": "Dodged Bullet", "severity": "Certain dealbreaker", "response": "Full-year capex: Q1 $0.4M + Q2 $0.9M + Q3 $1.5M + Q4 $2.1M = $4.9M.", "label": 0, "p": {"tinker://sample-run/sampler_weights/000128": 0.74, "Qwen/Qwen3.8-27B": 0.66, "thinkingmachines/Inkling": 0.15}},
+    {"task_id": "t05", "criterion_id": "c2", "criterion": "The response should state full-year capex: $2.1M.", "type": "Primary Intent", "severity": "Certain dealbreaker", "response": "Full-year capex: Q1 $0.4M + Q2 $0.9M + Q3 $1.5M + Q4 $2.1M = $4.9M.", "label": 0, "p": {"tinker://sample-run/sampler_weights/000128": 0.06, "Qwen/Qwen3.8-27B": 0.35, "thinkingmachines/Inkling": 0.02}},
+    {"task_id": "t06", "criterion_id": "c1", "criterion": "The response should state the effective date of the amendment: 1 Jan 2026.", "type": "Primary Intent", "severity": "Possible dealbreaker", "response": "The amendment took effect January 1, 2026.", "label": 1, "p": {"tinker://sample-run/sampler_weights/000128": 0.96, "Qwen/Qwen3.8-27B": null, "thinkingmachines/Inkling": 0.98}},
+    {"task_id": "t06", "criterion_id": "c2", "criterion": "The response should avoid hedging on which party bears termination costs.", "type": "Dodged Bullet", "severity": "Unlikely dealbreaker", "response": "Termination costs may fall on either party depending on interpretation.", "label": 0, "p": {"tinker://sample-run/sampler_weights/000128": 0.41, "Qwen/Qwen3.8-27B": 0.52, "thinkingmachines/Inkling": 0.11}}
+  ]
+}
+</script>
+
+<script>
+(() => {
+  const data = JSON.parse(document.getElementById("report-data").textContent);
+  const { meta, models, decisions } = data;
+  const verifier = models.find(m => m.role === "verifier") || models[0];
+  const vi = models.indexOf(verifier);
+  const ci = models.findIndex(m => m.role === "ceiling");
+  const bi = models.findIndex(m => m.role === "baseline");
+  const SERIES = ["var(--series-1)", "var(--series-2)", "var(--series-3)"];
+  const fmt = v => v == null ? "—" : v.toFixed(3);
+  const pct = v => v == null ? "—" : (v * 100).toFixed(1) + "%";
+  const signed = v => (v >= 0 ? "+" : "") + v.toFixed(3);
+  const el = (tag, attrs = {}, text) => {
+    const n = document.createElement(tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const svgEl = (tag, attrs = {}, text) => {
+    const n = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    for (const [k, v] of Object.entries(attrs)) n.setAttribute(k, v);
+    if (text != null) n.textContent = text;
+    return n;
+  };
+
+  // --- metrics ------------------------------------------------------------------
+  function score(rows, ref) {
+    const scored = rows.filter(d => d.p[ref] != null);
+    if (!scored.length) return { brier: null, acc: null, n: 0, unscored: rows.length };
+    const se = scored.reduce((s, d) => s + (d.p[ref] - d.label) ** 2, 0);
+    const hit = scored.filter(d => (d.p[ref] >= 0.5 ? 1 : 0) === d.label).length;
+    return { brier: 1 - se / scored.length, acc: hit / scored.length, n: scored.length, unscored: rows.length - scored.length };
+  }
+  const slices = [
+    ["Overall", () => true],
+    ["Primary Intent", d => d.type === "Primary Intent"],
+    ["Dodged Bullet", d => d.type === "Dodged Bullet"],
+    ["Certain dealbreaker", d => d.severity === "Certain dealbreaker"],
+    ["Possible dealbreaker", d => d.severity === "Possible dealbreaker"],
+    ["Unlikely dealbreaker", d => d.severity === "Unlikely dealbreaker"],
+  ].map(([name, f]) => {
+    const rows = decisions.filter(f);
+    return { name, n: rows.length, scores: models.map(m => score(rows, m.ref)) };
+  }).filter(s => s.n > 0);
+
+  // --- header -------------------------------------------------------------------
+  document.getElementById("subtitle").textContent =
+    `${meta.checker} checker on ${meta.data}, scored against ${meta.labels}.`;
+  if (meta.sample) document.getElementById("banner").append(
+    el("p", { class: "banner" }, "Sample data. Replace the report-data block with real eval output."));
+  const metaEl = document.getElementById("meta");
+  [["Verifier", verifier.ref], ["Dataset", meta.dataset], ["Decisions", String(decisions.length)],
+   ["Generated", meta.generated_at]].forEach(([k, v]) => {
+    metaEl.append(el("dt", {}, k));
+    const dd = el("dd"); dd.append(el("code", {}, v)); metaEl.append(dd);
+  });
+
+  // --- baseline headline (official scorer) --------------------------------------
+  const tileEl = (label, value, delta) => {
+    const t = el("div", { class: "tile" });
+    t.append(el("div", { class: "label" }, label), el("div", { class: "value" }, value));
+    if (delta) t.append(el("div", { class: "delta" }, delta));
+    return t;
+  };
+  if (meta.baseline) {
+    const b = meta.baseline, baseEl = document.getElementById("baseline");
+    const by = `${b.model} · judge ${b.judge}`;
+    baseEl.append(tileEl("Baseline all_pass", pct(b.all_pass), by),
+      tileEl("Baseline mean_criteria", pct(b.mean_criteria), by),
+      tileEl("GDP.pdf tasks graded", String(b.n_tasks), "official scorer"));
+    if (b.effort_counts) baseEl.append(tileEl("Answers at max tokens", String(b.hit_max_tokens ?? "—"),
+      "effort " + Object.entries(b.effort_counts).map(([e, n]) => `${e}: ${n}`).join(" · ")));
+  }
+  if (ci < 0) document.getElementById("ceiling-note").remove();
+
+  // --- tiles --------------------------------------------------------------------
+  const overall = slices[0].scores;
+  const v = overall[vi];
+  const diff = i => i >= 0 && v.brier != null && overall[i].brier != null ? v.brier - overall[i].brier : null;
+  const tiles = [
+    ["Brier reward", fmt(v.brier), diff(ci) != null ? `${signed(diff(ci))} vs ceiling` : ""],
+    ["Agreement with verdicts", pct(v.acc), "p ≥ 0.5 counts as pass"],
+    bi >= 0 ? ["Gain over zero-shot", diff(bi) != null ? signed(diff(bi)) : "—", "Brier reward"] : null,
+    ["Unscored", String(v.unscored), `of ${decisions.length} decisions`],
+  ].filter(Boolean);
+  const tilesEl = document.getElementById("tiles");
+  tiles.forEach(([label, value, delta]) => tilesEl.append(tileEl(label, value, delta)));
+
+  // --- legend -------------------------------------------------------------------
+  const legend = document.getElementById("legend");
+  models.forEach((m, i) => {
+    const s = el("span"); const sw = el("i", { class: "swatch" });
+    sw.style.background = SERIES[i % SERIES.length];
+    s.append(sw, document.createTextNode(m.label)); legend.append(s);
+  });
+
+  // --- chart: grouped horizontal bars ------------------------------------------
+  const chart = document.getElementById("chart");
+  const tip = document.getElementById("tooltip");
+  function draw() {
+    chart.querySelector("svg")?.remove();
+    const W = Math.max(288, chart.clientWidth);
+    const narrow = W < 560;
+    const labelW = narrow ? 0 : 180, valueW = 48, bar = 14, gap = 2;
+    const labelH = narrow ? 20 : 0, groupPad = 18;
+    const groupH = labelH + models.length * bar + (models.length - 1) * gap;
+    const top = 4, axisH = 22;
+    const plotW = W - labelW - valueW;
+    const H = top + slices.length * (groupH + groupPad) + axisH;
+    const x = val => labelW + val * plotW;
+    const svg = svgEl("svg", { viewBox: `0 0 ${W} ${H}`, role: "img",
+      "aria-label": "Brier reward by criterion slice and model" });
+
+    [0, 0.25, 0.5, 0.75, 1].forEach(t => {
+      svg.append(svgEl("line", { class: "grid", x1: x(t), x2: x(t), y1: top, y2: H - axisH }));
+      svg.append(svgEl("text", { x: x(t), y: H - 6, "text-anchor": t === 0 ? "start" : "middle" }, t.toFixed(2)));
+    });
+
+    slices.forEach((s, gi) => {
+      const gy = top + gi * (groupH + groupPad);
+      const by = gy + labelH;
+      const barsH = groupH - labelH;
+      svg.append(svgEl("text", narrow
+        ? { class: "group-label", x: 0, y: gy + 13 }
+        : { class: "group-label", x: 0, y: by + barsH / 2 + 4 }, `${s.name} (n=${s.n})`));
+      s.scores.forEach((sc, mi) => {
+        const y = by + mi * (bar + gap);
+        if (sc.brier != null && sc.brier > 0) {
+          const w = x(sc.brier) - labelW, r = Math.min(4, w);
+          svg.append(svgEl("path", {
+            d: `M${labelW},${y}h${w - r}a${r},${r} 0 0 1 ${r},${r}v${bar - 2 * r}a${r},${r} 0 0 1 ${-r},${r}h${-(w - r)}z`,
+            fill: SERIES[mi % SERIES.length] }));
+        }
+        svg.append(svgEl("text", { class: "value", x: x(Math.max(0, sc.brier ?? 0)) + 6, y: y + bar - 3 }, fmt(sc.brier)));
+        const hit = svgEl("rect", { class: "hit", x: labelW, y: y - 1, width: plotW + valueW, height: bar + 2 });
+        hit.addEventListener("mousemove", e => {
+          tip.replaceChildren(el("div", {}, `${s.name} · ${models[mi].label}`));
+          const line = el("div");
+          line.append("Brier reward ", el("b", {}, fmt(sc.brier)),
+            ` · agreement ${pct(sc.acc)} · n=${sc.n}${sc.unscored ? `, ${sc.unscored} unscored` : ""}`);
+          tip.append(line);
+          tip.style.display = "block";
+          const box = chart.getBoundingClientRect();
+          let left = e.clientX - box.left + 12;
+          if (left + tip.offsetWidth > box.width) left = e.clientX - box.left - tip.offsetWidth - 12;
+          tip.style.left = Math.max(0, left) + "px";
+          tip.style.top = (e.clientY - box.top + 14) + "px";
+        });
+        hit.addEventListener("mouseleave", () => { tip.style.display = "none"; });
+        svg.append(hit);
+      });
+    });
+    chart.append(svg);
+  }
+  draw();
+  let rt; addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(draw, 100); });
+
+  // --- table view ---------------------------------------------------------------
+  const table = document.getElementById("chart-table");
+  const head = el("tr"); head.append(el("th", {}, "Slice"), el("th", {}, "n"));
+  models.forEach(m => head.append(el("th", {}, `${m.label} Brier`), el("th", {}, `${m.label} agreement`)));
+  table.append(head);
+  slices.forEach(s => {
+    const tr = el("tr"); tr.append(el("td", {}, s.name), el("td", {}, String(s.n)));
+    s.scores.forEach(sc => tr.append(el("td", {}, fmt(sc.brier)), el("td", {}, pct(sc.acc))));
+    table.append(tr);
+  });
+
+  // --- lowest-scoring decisions -------------------------------------------------
+  const ranked = decisions
+    .filter(d => d.p[verifier.ref] != null)
+    .map(d => ({ ...d, pv: d.p[verifier.ref], err: (d.p[verifier.ref] - d.label) ** 2 }))
+    .sort((a, b) => b.err - a.err);
+  document.getElementById("ex-sub").textContent =
+    `Decisions where the ${verifier.label.toLowerCase()} is furthest from the official verdict, ranked by squared error (p − verdict)².`;
+  const exEl = document.getElementById("examples");
+  const filterEl = document.getElementById("ex-filter"), nEl = document.getElementById("ex-n");
+  const kv = (k, val) => { const s = el("span"); s.append(`${k} `, el("b", {}, val)); return s; };
+  function renderExamples() {
+    const f = filterEl.value;
+    const rows = ranked.filter(d =>
+      f === "all" || (f === "fp" ? d.label === 0 && d.pv >= 0.5 : d.label === 1 && d.pv < 0.5)
+    ).slice(0, +nEl.value);
+    exEl.replaceChildren();
+    if (!rows.length) { exEl.append(el("p", { class: "muted" }, "No decisions match.")); return; }
+    rows.forEach(d => {
+      const wrong = (d.pv >= 0.5 ? 1 : 0) !== d.label;
+      const card = el("article", { class: "ex" });
+      const headEl = el("div", { class: "ex-head" });
+      headEl.append(wrong
+        ? el("span", { class: "pill bad" }, d.label === 0 ? "False pass" : "False fail")
+        : el("span", { class: "pill" }, "Correct side, low confidence"));
+      headEl.append(el("span", { class: "pill" }, d.type));
+      if (d.severity) headEl.append(el("span", { class: "pill" }, d.severity));
+      headEl.append(el("span", { class: "muted" }, `${d.task_id} · ${d.criterion_id}`));
+      const nums = el("div", { class: "ex-nums" });
+      nums.append(kv("Official verdict", d.label ? "pass" : "fail"), kv("Verifier p(pass)", d.pv.toFixed(2)),
+        kv("Squared error", d.err.toFixed(3)));
+      models.filter(m => m !== verifier).forEach(m =>
+        nums.append(kv(m.label, d.p[m.ref] == null ? "unscored" : d.p[m.ref].toFixed(2))));
+      const det = el("details");
+      det.append(el("summary", {}, "Response the verifier saw"), el("pre", {}, d.response));
+      card.append(headEl, el("p", { class: "ex-crit" }, d.criterion), nums, det);
+      exEl.append(card);
+    });
+  }
+  filterEl.addEventListener("change", renderExamples);
+  nEl.addEventListener("change", renderExamples);
+  renderExamples();
+})();
+</script>
+</body>
+</html>

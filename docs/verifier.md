@@ -13,6 +13,7 @@ Both learned checkers are built on the Tinker cookbook's decision-model recipe
 Everything runs through Tinker's API. Model weights may come from any vendor Tinker serves.
 
 Schemas: `src/gdpsolve/schemas.py`, verifier section. Tests: `tests/test_smoke.py`.
+One-day training and integration plan: [`verifier-trd.md`](verifier-trd.md).
 
 ## Rules
 
