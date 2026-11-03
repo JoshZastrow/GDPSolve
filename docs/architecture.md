@@ -238,6 +238,8 @@ There is no daemon or server. Everything runs on one machine, and only model sam
 
 v0 puts `process()`, the router, the worker loop and the tools in one file, `src/gdpsolve/run.py`, with an in-process thread pool instead of the SQLite queue ([`process-spec.md`](process-spec.md)). The layout below is the longer-term target.
 
+The document service (`src/gdpsolve/service.py`, `gdpsolve serve`) and its SDK (`src/gdpsolve/client.py`) give Reducto-shaped parse, extract, split, and classify over HTTP; the GDP.pdf eval calls it only through the SDK ([`service-spec.md`](service-spec.md)).
+
 ```
 src/gdpsolve/
   pipeline.py   process()
