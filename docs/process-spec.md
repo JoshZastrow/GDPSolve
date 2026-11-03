@@ -216,6 +216,13 @@ Do not stop the server at the end of the run. The next run uses the warm server.
 - `temperature`: 0. `max_tokens`: 2048.
 
 It returns the text of the first choice. The server has slots, so there is no lock in Python.
+
+Measured on 2026-11-02 (Apple Silicon, Metal): the first `OCR:` request took 1.07 s and a repeat took 0.09 s.
+A small table took 0.75 s.
+Output formats:
+- `OCR:` gives plain text with `\n` between lines.
+- `Table Recognition:` gives OTSL tags, not HTML: `<fcel>` starts a cell and `<nl>` ends a row.
+  Convert OTSL to a Markdown table before the model sees it.
 Unit tests use `FakeRecognizer` and a fake HTTP server. The live test needs `RUN_LIVE=1`.
 
 Give the model the prompt for the mode:
