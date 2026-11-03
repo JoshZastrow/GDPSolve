@@ -158,12 +158,6 @@ def test_config():
 
 
 STUBS = [
-    ("plan", lambda r: run.plan(None, r.req)),
-    ("react", lambda r: run.react(None, r.req, None, r)),
-    ("merge", lambda r: run.merge(None, r.req, {})),
-    ("process", lambda r: run.process(r.req, FakePolicy([]), FakeRecognizer())),
-    ("final_ended", lambda r: r.final_ended()),
-    ("put_merge_job_when_children_ended", lambda r: r.put_merge_job_when_children_ended()),
     ("run_eval", lambda r: run.run_eval([], r.req.path.parent, r.req.path.parent / "results.jsonl")),
 ]
 
@@ -634,6 +628,248 @@ def test_worker_runs_jobs_until_none(tmp_path, monkeypatch):
 
 
 # --- T5 ---
+
+
+def fake_doc(page_count: int):
+    """A Document with `page_count` pages and no real PDF (for the router tests)."""
+    from gdpsolve.schemas import Document, DocumentMetadata, ObjectRef
+
+    return Document(metadata=DocumentMetadata(filename="a.pdf", sha256="0" * 64, page_count=page_count,
+                                              encrypted=False, has_text_layer=True),
+                    pdf=ObjectRef(sha256="0" * 64, media_type="application/pdf", size=1))
+
+
+def router_run(tmp_path, page_count: int, deadline_s: int = 300):
+    """A Run over fake_doc(page_count) whose final job is the root job from plan(); returns (run, root)."""
+    r = make_run(tmp_path, deadline_s=deadline_s)
+    r.doc = fake_doc(page_count)
+    root = run.plan(r.doc, r.req)
+    r.final_id = root.id
+    return r, root
+
+
+def split_msg(job_id: str, pages_per_job: int = 10, pages=()) -> Message:
+    return Message(thread="t", job_id=job_id, kind="split", pages=list(pages), pages_per_job=pages_per_job)
+
+
+def ready(job_id: str, answer: str = "a", fields=()):
+    from gdpsolve.schemas import Report
+
+    return Report(job_id=job_id, state="ready", summary="s", answer=answer, fields=list(fields))
+
+
+def field(name: str, confidence: float):
+    from gdpsolve.schemas import ExtractedField
+
+    return ExtractedField(name=name, value=1, confidence=confidence)
+
+
+@pytest.mark.parametrize("page_count,max_steps", [(3, 8), (100, 28), (300, 40)])
+def test_plan_makes_one_root_job_for_all_pages(tmp_path, page_count, max_steps):
+    r, root = router_run(tmp_path, page_count)
+    assert root.kind == "extract" and root.pages is None and root.parent_id is None and root.after == []
+    assert root.max_steps == max_steps and root.request_id == r.req.id and root.instructions == "q"
+    assert time.time() + 290 < root.deadline_at.timestamp() <= time.time() + 300
+
+
+def test_react_split_makes_at_most_16_children_and_a_waiting_merge_job(tmp_path):
+    r, root = router_run(tmp_path, 100)
+    children = run.react(r.doc, r.req, split_msg(root.id, pages_per_job=5), r)
+    assert len(children) == 16 and all(len(c.pages) >= 5 for c in children)
+    assert [p for c in children for p in c.pages] == list(range(1, 101))
+    assert all(c.kind == "extract" and c.parent_id == root.id for c in children)
+    [merge_job] = r.waiting
+    assert merge_job.kind == "merge" and merge_job.after == [c.id for c in children]
+    assert r.final_id == merge_job.id and r.jobs.empty()
+
+
+def test_react_split_children_have_at_least_5_pages(tmp_path):
+    r, root = router_run(tmp_path, 12)
+    children = run.react(r.doc, r.req, split_msg(root.id, pages_per_job=2), r)
+    assert [c.pages for c in children] == [list(range(1, 7)), list(range(7, 13))]
+
+
+def test_react_split_covers_the_requested_pages(tmp_path):
+    r, root = router_run(tmp_path, 100)
+    children = run.react(r.doc, r.req, split_msg(root.id, pages_per_job=10, pages=range(21, 41)), r)
+    assert [c.pages for c in children] == [list(range(21, 31)), list(range(31, 41))]
+
+
+@pytest.mark.parametrize("case", ["deadline", "not_final", "too_few_pages", "not_split", "none"])
+def test_react_rejects(tmp_path, case):
+    r, root = router_run(tmp_path, 4 if case == "too_few_pages" else 100, deadline_s=100 if case == "deadline" else 300)
+    msg = {"not_final": split_msg("other"), "not_split": Message(thread="t", job_id=root.id, kind="note"),
+           "none": None}.get(case, split_msg(root.id))
+    assert run.react(r.doc, r.req, msg, r) == [] and r.waiting == [] and r.final_id == root.id
+
+
+def test_react_rejects_a_second_split(tmp_path):
+    r, root = router_run(tmp_path, 100)
+    run.react(r.doc, r.req, split_msg(root.id), r)
+    merge_id = r.final_id
+    assert run.react(r.doc, r.req, split_msg(merge_id), r) == [] and len(r.waiting) == 1 and r.final_id == merge_id
+
+
+def test_merge_job_waits_for_all_children(tmp_path):
+    from gdpsolve.schemas import Report
+
+    r, root = router_run(tmp_path, 20)
+    a, b = run.react(r.doc, r.req, split_msg(root.id, pages_per_job=10), r)
+    r.put_merge_job_when_children_ended()
+    assert r.jobs.empty() and len(r.waiting) == 1
+    r.reports[a.id] = ready(a.id, answer="total is 7")
+    r.reports[b.id] = Report(job_id=b.id, state="progress", summary="half")
+    r.put_merge_job_when_children_ended()
+    assert r.jobs.empty() and not r.final_ended()
+    r.reports[b.id] = Report(job_id=b.id, state="failed", summary="unreadable")
+    r.put_merge_job_when_children_ended()
+    merge_job = r.jobs.get_nowait()
+    assert merge_job.id == r.final_id and r.waiting == []
+    assert "total is 7" in merge_job.instructions and "unreadable" in merge_job.instructions
+
+
+def test_final_ended(tmp_path):
+    from gdpsolve.schemas import Report
+
+    r, root = router_run(tmp_path, 3)
+    assert not r.final_ended()
+    r.reports[root.id] = Report(job_id=root.id, state="progress", summary="s")
+    assert not r.final_ended()
+    r.reports[root.id] = Report(job_id=root.id, state="failed", summary="s")
+    assert r.final_ended()
+
+
+def test_merge_uses_the_final_report(tmp_path):
+    doc, req = fake_doc(3), make_run(tmp_path).req
+    reports = {"root": ready("root", "root answer"), "c1": ready("c1", "c1"),
+               "m": ready("m", "merged", [field("x", 0.9), field("y", 0.6)])}
+    result = run.merge(doc, req, reports, final_id="m", root_id="root")
+    assert result.status == "ok" and result.answer == "merged" and [f.name for f in result.fields] == ["x", "y"]
+    assert result.confidence == 0.6 and result.request_id == req.id and result.document == doc.metadata
+
+
+def test_merge_falls_back_to_the_root_report(tmp_path):
+    doc, req = fake_doc(3), make_run(tmp_path).req
+    result = run.merge(doc, req, {"root": ready("root", "root answer"), "c1": ready("c1")}, "m", "root")
+    assert result.status == "ok" and result.answer == "root answer" and result.confidence == 0.0
+
+
+def test_merge_joins_ready_answers_as_partial(tmp_path):
+    from gdpsolve.schemas import Report
+
+    doc, req = fake_doc(3), make_run(tmp_path).req
+    reports = {"c1": ready("c1", "first", [field("x", 0.8)]), "c2": Report(job_id="c2", state="failed", summary="s"),
+               "c3": ready("c3", "third")}
+    result = run.merge(doc, req, reports, "m", "root")
+    assert result.status == "partial" and result.answer == "first\n\nthird" and result.confidence == 0.8
+
+
+def test_merge_without_ready_reports_fails(tmp_path):
+    from gdpsolve.schemas import Report
+
+    doc, req = fake_doc(3), make_run(tmp_path).req
+    result = run.merge(doc, req, {"root": Report(job_id="root", state="failed", summary="s")}, "root", "root")
+    assert result.status == "failed" and result.answer is None and result.error
+
+
+def process_file(tmp_path, monkeypatch, data: bytes, policy, deadline_s: int = 300, passwords=(), workers: int = 4):
+    """process() of `data` written to tmp_path/a.pdf, with the store in tmp_path/var/objects."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.pdf").write_bytes(data)
+    req = ExtractionRequest(path=tmp_path / "a.pdf", instructions="Find the total.", deadline_s=deadline_s,
+                            passwords=list(passwords))
+    return run.process(req, policy, FakeRecognizer(), workers=workers)
+
+
+class JobPolicy:
+    """Turns by job, read from the first message: the root job splits, a child reads its first page,
+    the merge job answers. `on_merge(first_text)` runs at the merge job's first step; `on_root_report()` runs
+    before the root job reports."""
+
+    def __init__(self, page_count: int, on_merge=None, on_root_report=None):
+        self.page_count = page_count
+        self.on_merge = on_merge or (lambda text: None)
+        self.on_root_report = on_root_report or (lambda: None)
+        self.events: list = []  # ("child", pages) when a child reports; ("merge", first text) at merge start
+        self._lock = threading.Lock()
+
+    def step(self, messages: list) -> run.Turn:
+        import re
+
+        first = text_of(messages[0])
+        steps = sum(m["role"] == "assistant" for m in messages)
+        if "(merge)" in first:
+            with self._lock:
+                self.events.append(("merge", first))
+            self.on_merge(first)
+            return run.Turn("report", {"state": "ready", "summary": "merged", "answer": "merged",
+                                       "fields": [{"name": "total", "value": 7, "confidence": 0.7}]}, 10, 1)
+        pages = json.loads(re.search(r"covers pages (\[[\d, ]*\])", first).group(1))
+        if len(pages) == self.page_count:  # the root job
+            if steps == 0:
+                return run.Turn("split", {"pages_per_job": 5}, 10, 1)
+            self.on_root_report()
+            return run.Turn("report", {"state": "ready", "summary": "split", "answer": "root"}, 10, 1)
+        if steps == 0:
+            return run.Turn("read_native_text", {"page": pages[0]}, 10, 1)
+        with self._lock:
+            self.events.append(("child", pages))
+        return run.Turn("report", {"state": "ready", "summary": "read", "answer": f"pages {pages[0]}-{pages[-1]}"},
+                        10, 1)
+
+
+def test_process_one_job_runs_from_start_to_end(tmp_path, monkeypatch):
+    policy = FakePolicy([run.Turn("read_native_text", {"page": 1}, 100, 10),
+                         run.Turn("report", {"state": "ready", "summary": "done", "answer": "Total 42",
+                                             "fields": [{"name": "total", "value": 42, "confidence": 0.9}]}, 100, 10)])
+    result = process_file(tmp_path, monkeypatch, make_pdf(["Total 42"]), policy, workers=1)
+    assert result.status == "ok" and result.answer == "Total 42" and result.confidence == 0.9
+    assert len(policy.seen) == 2 and "Total 42" in text_of(policy.seen[1][-1])  # the tool saw the real page
+
+
+def test_process_split_runs_children_then_the_merge_job(tmp_path, monkeypatch):
+    policy = JobPolicy(12)
+    result = process_file(tmp_path, monkeypatch, make_pdf([f"P{n}" for n in range(1, 13)]), policy)
+    assert result.status == "ok" and result.answer == "merged" and result.confidence == 0.7
+    kinds = [e[0] for e in policy.events]
+    assert kinds == ["child", "child", "merge"]  # the merge job starts after both children report
+    assert sorted(e[1] for e in policy.events[:2]) == [list(range(1, 7)), list(range(7, 13))]
+    assert "pages 1-6" in policy.events[2][1] and "pages 7-12" in policy.events[2][1]
+
+
+def test_process_short_deadline_gives_partial(tmp_path, monkeypatch):
+    real, offset, release = time.time, [0.0], threading.Event()
+    monkeypatch.setattr(run.time, "time", lambda: real() + offset[0])
+
+    def on_merge(text):  # the deadline passes while the merge job works
+        offset[0] += 1000
+        release.wait(10)
+
+    policy = JobPolicy(12, on_merge=on_merge, on_root_report=lambda: release.wait(10))
+    try:
+        result = process_file(tmp_path, monkeypatch, make_pdf([f"P{n}" for n in range(1, 13)]), policy)
+    finally:
+        release.set()
+    assert result.status == "partial"
+    assert sorted(result.answer.split("\n\n")) == ["pages 1-6", "pages 7-12"]
+
+
+def test_process_wrong_password_makes_no_job(tmp_path, monkeypatch):
+    policy = FakePolicy([])
+    data = make_encrypted(make_pdf(["Secret"]), "pw")
+    result = process_file(tmp_path, monkeypatch, data, policy, passwords=[SecretStr("nope")])
+    assert result.status == "password_required" and policy.seen == []
+
+
+def test_process_starts_the_ocr_server_only_for_the_real_recognizer(tmp_path, monkeypatch):
+    started = []
+    monkeypatch.setattr(run, "ensure_ocr_server", lambda: started.append(1) or 0.0)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.pdf").write_bytes(make_pdf(["x"]))
+    req = ExtractionRequest(path=tmp_path / "a.pdf", instructions="q")
+    done = run.Turn("report", {"state": "ready", "summary": "s", "answer": "x"}, 1, 1)
+    assert run.process(req, FakePolicy([done]), FakeRecognizer(), workers=1).status == "ok" and started == []
+    assert run.process(req, FakePolicy([done]), workers=1).status == "ok" and started == [1]
 
 
 # --- T6 ---
