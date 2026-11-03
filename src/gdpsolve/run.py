@@ -212,8 +212,16 @@ def _region(run: Run, tool: str, args, page_no: int, bbox: BoundingBox | None, d
 
 
 def recognize(run: Run, args: Recognize) -> str:
-    """`run.recognizer` on one Region: text, HTML, or LaTeX."""
-    raise NotImplementedError
+    """`run.recognizer` on one Region: text, a Markdown table, or LaTeX."""
+    from PIL import Image
+
+    from gdpsolve.verifier import store
+
+    region = run.regions.get(args.region)
+    if region is None:
+        return f"unknown region: {args.region}; make one with render or crop"
+    return _memo(run, "recognize", args,
+                 lambda: run.recognizer(Image.open(io.BytesIO(store.get(region.image))), args.mode))
 
 
 def run_tool(run: Run, job: Job, tool: str, args: dict) -> list[dict]:
@@ -252,9 +260,74 @@ def run_tool(run: Run, job: Job, tool: str, args: dict) -> list[dict]:
 # --- recognizer ---
 
 
+LLAMA_LOG = Path("var/log/llama-serve.log")
+_warmed: set[str] = set()  # server URLs that ensure_ocr_server has warmed up
+
+
+def _healthy(url: str) -> bool:
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{url}/health", timeout=2) as resp:
+            return resp.status == 200
+    except OSError:
+        return False
+
+
 def ensure_ocr_server(url: str = OCR_URL, timeout_s: int = 300) -> float:
-    """Start the PaddleOCR-VL server if it is not up, then warm it up; returns the warm-up seconds."""
-    raise NotImplementedError
+    """Start the PaddleOCR-VL server if it is not up, then warm it up; returns the warm-up seconds.
+
+    A second call for the same URL does nothing and returns 0.0. The server is never stopped.
+    """
+    import shutil
+    import subprocess
+    from urllib.parse import urlparse
+
+    from PIL import Image, ImageDraw
+
+    if url in _warmed:
+        return 0.0
+    if not _healthy(url):
+        llama = shutil.which("llama") or str(Path.home() / ".local/bin/llama")
+        cmd = [llama, "serve", "-hf", "PaddlePaddle/PaddleOCR-VL-1.6-GGUF", "--temp", "0",
+               "--port", str(urlparse(url).port), "-np", "4", "--alias", "paddleocr-vl"]
+        LLAMA_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with LLAMA_LOG.open("ab") as log:
+            subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+        end = time.time() + timeout_s
+        while not _healthy(url):
+            if time.time() >= end:
+                raise RuntimeError(f"OCR server at {url} not healthy after {timeout_s} s; see {LLAMA_LOG}")
+            time.sleep(2)
+    image = Image.new("RGB", (160, 64), "white")
+    ImageDraw.Draw(image).text((16, 12), "warm", fill="black", font_size=32)
+    start = time.time()
+    PaddleRecognizer(url)(image, "text")
+    _warmed.add(url)
+    return time.time() - start
+
+
+def otsl_to_markdown(otsl: str) -> str:
+    """PaddleOCR-VL table output (OTSL: <fcel> cell, <ecel> empty cell, <nl> end of row) as a Markdown table.
+
+    Merged cells (<lcel>, <ucel>, <xcel>) become empty cells. Text without OTSL tags is returned as it is.
+    """
+    import re
+
+    if not re.search(r"<(fcel|ecel)>", otsl):
+        return otsl
+    rows = []
+    for line in otsl.split("<nl>"):
+        parts = re.split(r"<(fcel|ecel|lcel|ucel|xcel)>", line)  # [before, tag, text, tag, text, ...]
+        cells = [text.strip().replace("|", "\\|") if tag == "fcel" else ""
+                 for tag, text in zip(parts[1::2], parts[2::2])]
+        if cells:
+            rows.append(cells)
+    width = max(len(r) for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(r) + " |" for r in rows]
+    lines.insert(1, "| " + " | ".join(["---"] * width) + " |")
+    return "\n".join(lines)
 
 
 class PaddleRecognizer:
@@ -264,8 +337,27 @@ class PaddleRecognizer:
         self.url = url
 
     def __call__(self, image: Image.Image, mode: str) -> str:
-        """Text of the first choice for `image` with the prompt OCR_PROMPTS[mode]."""
-        raise NotImplementedError
+        """Text of the first choice for `image` with the prompt OCR_PROMPTS[mode]; tables as Markdown."""
+        import base64
+        import urllib.request
+
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        body = {
+            "model": "paddleocr-vl",
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": data_url}},
+                {"type": "text", "text": OCR_PROMPTS[mode]},
+            ]}],
+            "temperature": 0,
+            "max_tokens": 2048,
+        }
+        req = urllib.request.Request(f"{self.url}/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=300) as resp:
+            text = json.load(resp)["choices"][0]["message"]["content"]
+        return otsl_to_markdown(text) if mode == "table" else text
 
 
 # --- policy ---
