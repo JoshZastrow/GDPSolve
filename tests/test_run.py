@@ -3,16 +3,18 @@
 Each task adds its tests only in its own `# --- T<n> ---` section.
 """
 
+import hashlib
 import io
 import threading
 import time
 
 import pypdfium2 as pdfium
 import pytest
+from pydantic import SecretStr
 
 from gdpsolve import run
 from gdpsolve.eval import pdf_input
-from gdpsolve.schemas import ExtractionRequest, Message
+from gdpsolve.schemas import Document, ExtractionRequest, ExtractionResult, Message
 
 
 def make_pdf(pages: list[str]) -> bytes:
@@ -154,7 +156,6 @@ def test_config():
 
 
 STUBS = [
-    ("ingest", lambda r: run.ingest(r.req)),
     ("inspect_pdf", lambda r: run.inspect_pdf(r, None)),
     ("read_native_text", lambda r: run.read_native_text(r, None)),
     ("render", lambda r: run.render(r, None)),
@@ -183,6 +184,56 @@ def test_stub_raises_not_implemented(tmp_path, name, call):
 
 
 # --- T1 ---
+
+
+def ingest_file(tmp_path, monkeypatch, data: bytes, passwords=()):
+    """ingest() of `data` written to tmp_path/a.pdf, with the store in tmp_path/var/objects."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "a.pdf").write_bytes(data)
+    return run.ingest(ExtractionRequest(path=tmp_path / "a.pdf", instructions="q", passwords=list(passwords)))
+
+
+def test_ingest_plain_pdf(tmp_path, monkeypatch):
+    from gdpsolve.verifier import store
+
+    data = make_pdf(["One", "Two", "Three"])
+    doc = ingest_file(tmp_path, monkeypatch, data)
+    assert isinstance(doc, Document)
+    assert doc.metadata.sha256 == hashlib.sha256(data).hexdigest()
+    assert doc.metadata.page_count == 3 and doc.metadata.filename == "a.pdf"
+    assert not doc.metadata.encrypted and doc.metadata.has_text_layer
+    assert store.get(doc.pdf) == data and doc.pdf.media_type == "application/pdf"
+
+
+def test_ingest_right_password_opens_encrypted_pdf(tmp_path, monkeypatch):
+    from gdpsolve.verifier import store
+
+    data = make_encrypted(make_pdf(["Secret"]), "pw")
+    doc = ingest_file(tmp_path, monkeypatch, data, [SecretStr("nope"), SecretStr("pw")])
+    assert isinstance(doc, Document)
+    assert doc.metadata.encrypted and doc.metadata.page_count == 1
+    assert doc.metadata.sha256 == hashlib.sha256(data).hexdigest()
+    stored = pdfium.PdfDocument(store.get(doc.pdf))  # decrypted: opens without the password
+    assert pdf_input.page_text(stored[0]) == "Secret"
+
+
+@pytest.mark.parametrize("passwords", [[], [SecretStr("nope")]], ids=["none", "wrong"])
+def test_ingest_wrong_password_gives_password_required(tmp_path, monkeypatch, passwords):
+    data = make_encrypted(make_pdf(["Secret"]), "pw")
+    result = ingest_file(tmp_path, monkeypatch, data, passwords)
+    assert isinstance(result, ExtractionResult) and result.status == "password_required"
+    assert result.document.encrypted and result.document.sha256 == hashlib.sha256(data).hexdigest()
+
+
+def test_ingest_corrupt_file_fails(tmp_path, monkeypatch):
+    result = ingest_file(tmp_path, monkeypatch, b"not a pdf")
+    assert isinstance(result, ExtractionResult) and result.status == "failed" and result.error
+
+
+def test_ingest_missing_file_fails(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    result = run.ingest(ExtractionRequest(path=tmp_path / "missing.pdf", instructions="q"))
+    assert isinstance(result, ExtractionResult) and result.status == "failed" and result.error
 
 
 # --- T2 ---
