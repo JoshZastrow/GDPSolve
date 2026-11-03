@@ -271,6 +271,23 @@ def rl_cost(row: dict) -> float:
     return usd
 
 
+def headroom(records: list[dict]) -> dict[int, dict]:
+    """Per training step, from the trainer's rollout records: mean@k (all rollouts), max@k (mean over groups of
+    the best rollout), and frac_equal, the share of groups whose rewards are all within 0.01. Such a group has
+    zero advantage after centering, so it teaches nothing."""
+    groups: dict[int, dict[int, list[float]]] = {}
+    for r in records:
+        groups.setdefault(r["iteration"], {}).setdefault(r["group_idx"], []).append(r["total_reward"])
+    out = {}
+    for step, by_group in sorted(groups.items()):
+        rewards = list(by_group.values())
+        flat = [x for g in rewards for x in g]
+        out[step] = {"mean@k": sum(flat) / len(flat), "max@k": sum(map(max, rewards)) / len(rewards),
+                     "frac_equal": sum(max(g) - min(g) <= 0.01 for g in rewards) / len(rewards),
+                     "groups": len(rewards)}
+    return out
+
+
 # --- env ---
 
 
