@@ -62,6 +62,20 @@ def download_gdp_pdf(
     typer.echo(f"downloaded {repo}@{revision[:8]} -> {path} ({len(pdfs)} PDFs)")
 
 
+@download_app.command("parsebench")
+def download_parsebench(
+    test: Annotated[bool, typer.Option(help="Small test subset (3 documents per category).")] = False,
+    out: Annotated[Path | None, typer.Option(help="Output directory (default data/parsebench[-test]).")] = None,
+    revision: Annotated[str | None, typer.Option(help="Dataset revision (default: the leaderboard's).")] = None,
+) -> None:
+    """Download ParseBench (evaluation only by project policy)."""
+    from gdpsolve.eval import parsebench
+
+    path = parsebench.download(test, out, revision)
+    pdfs = list(path.rglob("*.pdf"))
+    typer.echo(f"downloaded {parsebench.REPO} -> {path} ({len(pdfs)} PDFs)")
+
+
 @synth_app.command("tasks")
 def synth_tasks(
     n: Annotated[int, typer.Option(help="Tasks to request from the teacher model.")] = 40,
@@ -265,3 +279,58 @@ def score_gdp_pdf(
     (results.parent / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
     typer.echo(json.dumps(summary, indent=2))
 
+
+
+@eval_app.command("parsebench")
+def eval_parsebench(
+    results: Annotated[Path, typer.Argument(help="Parser outputs: <group>/<test_id>.result.json (ParseBench layout).")],
+    data: Annotated[Path | None, typer.Option(help="ParseBench directory (default data/parsebench[-test]).")] = None,
+    test: Annotated[bool, typer.Option(help="Score against the test subset.")] = False,
+    dimension: Annotated[list[str] | None, typer.Option(help="Only these dimensions (repeatable).")] = None,
+    report: Annotated[Path | None, typer.Option(help="Report directory (default <results>/_parsebench).")] = None,
+) -> None:
+    """ParseBench leaderboard scores (0-100) via its own harness; prints overall, or the one dimension."""
+    import json
+
+    from gdpsolve.eval import parsebench
+
+    unknown = set(dimension or []) - set(parsebench.DIMENSIONS)
+    if unknown:
+        raise typer.BadParameter(f"--dimension must be in {sorted(parsebench.DIMENSIONS)}")
+    data = data or (parsebench.TEST_DIR if test else parsebench.DEFAULT_DIR)
+    report = report or results / "_parsebench"
+    summary = parsebench.evaluate(results, data, report, dimension)
+    report.mkdir(parents=True, exist_ok=True)
+    (report / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    typer.echo(json.dumps(summary), err=True)
+    value = summary["scores"][dimension[0]] if dimension and len(dimension) == 1 else summary["overall"]
+    typer.echo("n/a" if value is None else f"{value:.2f}")
+
+
+@score_app.command("parsebench")
+def score_parsebench(
+    result: Annotated[Path, typer.Argument(help="One <group>/<test_id>.result.json.")],
+    data: Annotated[Path | None, typer.Option(help="ParseBench directory (default data/parsebench[-test]).")] = None,
+    test: Annotated[bool, typer.Option(help="Use the test subset.")] = False,
+) -> None:
+    """ParseBench verifier on one output: page score in [0, 1] per test case it matches (null = unscored)."""
+    import json
+    import sys
+
+    from gdpsolve.eval import parsebench
+    from gdpsolve.verifier import parsebench as verifier
+
+    data = data or (parsebench.TEST_DIR if test else parsebench.DEFAULT_DIR)
+    raw = json.loads(result.read_text())
+    example_id = raw["request"]["example_id"]
+    scores = {}
+    with contextlib.redirect_stdout(sys.stderr):  # parse-bench prints progress to stdout
+        for group, folder in parsebench.RESULTS_DIR.items():
+            if folder != result.parent.name:
+                continue
+            for test_id, case in parsebench.load_cases(data, group).items():
+                if test_id == example_id or test_id.startswith(example_id + "/"):
+                    scores[f"{group}:{test_id}"] = verifier.score(raw, case)
+    if not scores:
+        raise typer.BadParameter(f"no {result.parent.name} test case matches {example_id!r} in {data}")
+    typer.echo(json.dumps(scores))

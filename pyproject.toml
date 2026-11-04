@@ -22,6 +22,9 @@ train = [
 eval = [
     "gdp-pdf @ git+https://github.com/surge-ai/gdp-pdf@7a72a514a6ab19c90babb00adc817e4ae86b9c1b",
 ]
+parsebench = [
+    "parse-bench @ git+https://github.com/run-llama/ParseBench@c38085d2ccd7f717900037e361806d22c51bc33b",  # leaderboard scored_with
+]
 
 [build-system]
 requires = ["uv_build>=0.11.15,<0.12.0"]
