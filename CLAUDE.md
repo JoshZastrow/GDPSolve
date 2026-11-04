@@ -45,6 +45,7 @@ uv run gdpsolve serve --port 8787 --workers 16 [--checkpoint tinker://.../sample
 uv run gdpsolve eval gdp-pdf --system service --url http://127.0.0.1:8787 --concurrency 16 --out var/runs/<name>
 uv run gdpsolve score gdp-pdf var/runs/<name>/results.jsonl
 uv run gdpsolve synth docqa | eval docqa | train docqa
+uv run gdpsolve eval parsebench <results dir> --dimension ...
 ```
 
 Use Context7 for current library docs (tinker, tinker-cookbook, pypdfium2) before you write against their APIs.
